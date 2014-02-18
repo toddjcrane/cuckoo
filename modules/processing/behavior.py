@@ -144,9 +144,10 @@ class ParseProcessLog(list):
     def log_thread(self, context, pid):
         pass
 
-    def log_anomaly(self, subcategory, tid, msg):
+    def log_anomaly(self, subcategory, tid, funcname, msg):
         self.lastcall = dict(thread_id=tid, category="anomaly", api="",
-                             subcategory=subcategory, msg=msg)
+                             subcategory=subcategory, funcname=funcname,
+                             msg=msg)
 
     def log_call(self, context, apiname, category, arguments):
         apiindex, status, returnval, tid, timediff = context
@@ -858,10 +859,12 @@ class Anomaly(object):
         if call["category"] != "anomaly":
             return
 
-        category, message = None, None
+        category, funcname, message = None, None, None
         for row in call["arguments"]:
             if row["name"] == "Subcategory":
                 category = row["value"]
+            if row["name"] == "FunctionName":
+                funcname = row["value"]
             if row["name"] == "Message":
                 message = row["value"]
 
@@ -869,6 +872,7 @@ class Anomaly(object):
             name=process["process_name"],
             pid=process["process_id"],
             category=category,
+            funcname=funcname,
             message=message,
         ))
 
