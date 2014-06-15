@@ -446,13 +446,9 @@ class Scheduler:
         except CuckooMachineError as e:
             raise CuckooCriticalError("Error initializing machines: %s" % e)
 
-        # At this point all the available machines should have been identified
-        # and added to the list. If none were found, Cuckoo needs to abort the
-        # execution.
-        if not len(machinery.machines()):
-            raise CuckooCriticalError("No machines available")
-        else:
-            log.info("Loaded %s machine/s", len(machinery.machines()))
+        # At this point all standard VMs should have been identified and
+        # added to the list. However, VMs may be added later on dynamically.
+        log.info("Loaded %s machine/s", len(machinery.machines()))
 
     def stop(self):
         """Stop scheduler."""

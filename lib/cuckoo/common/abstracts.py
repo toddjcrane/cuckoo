@@ -90,11 +90,15 @@ class Machinery(object):
         self.module_name = module_name
         mmanager_opts = self.options.get(module_name)
 
-        for machine_id in mmanager_opts["machines"].strip().split(","):
+        for machine_id in mmanager_opts["machines"].split(","):
+            machine_id = machine_id.strip()
+            if not machine_id:
+                continue
+
             try:
-                machine_opts = self.options.get(machine_id.strip())
+                machine_opts = self.options.get(machine_id)
                 machine = Dictionary()
-                machine.id = machine_id.strip()
+                machine.id = machine_id
                 machine.label = machine_opts[self.LABEL]
                 machine.platform = machine_opts["platform"]
                 machine.tags = machine_opts.get("tags", None)
