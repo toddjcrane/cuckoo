@@ -19,7 +19,9 @@ from datetime import datetime
 
 from lib.cuckoo.common.exceptions import CuckooOperationalError
 from lib.cuckoo.common.config import Config
+
 from lib.cuckoo.common.constants import CUCKOO_ROOT, CUCKOO_VERSION
+from lib.cuckoo.common.constants import GITHUB_URL, ISSUES_PAGE_URL
 
 try:
     import chardet
@@ -301,10 +303,10 @@ def exception_message():
         "Oops! Cuckoo failed in an unhandled exception!\nSometimes bugs are "
         "already fixed in the development release, it is therefore "
         "recommended to retry with the latest development release available "
-        "at https://github.com/cuckoosandbox/cuckoo\n"
-        "If the error persists please open a new issue at "
-        "https://github.com/cuckoosandbox/cuckoo/issues\n\n"
+        "%s\nIf the error persists please open a new issue at %s\n\n" % \
+        (GITHUB_URL, ISSUES_PAGE_URL)
     )
+
     msg += "=== Exception details ===\n"
     msg += "Cuckoo version: %s\n" % CUCKOO_VERSION
     msg += "OS version: %s\n" % os.name
@@ -312,7 +314,10 @@ def exception_message():
 
     git_version = os.path.join(CUCKOO_ROOT, ".git", "refs", "heads", "master")
     if os.path.exists(git_version):
-        msg += "Git version: %s\n" % open(git_version, "rb").read().strip()
+        try:
+            msg += "Git version: %s\n" % open(git_version, "rb").read().strip()
+        except:
+            pass
 
     try:
         import pip
