@@ -539,7 +539,7 @@ def ioc_get(task_id):
                              "%d" % task_id, "reports", "ioc.json")
     if os.path.exists(file_path):
         try:
-        data = open(file_path)
+            data = open(file_path)
             return data.read()
         except:
             return json_error(500, "An error occurred while reading IOCs")
