@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 def run(*args):
+    """Wrapper to Popen."""
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = p.communicate()
     return stdout, stderr
@@ -40,8 +41,9 @@ def rt_available(rt_table):
         return False
 
 def vpn_status():
+    """Gets current VPN status."""
     ret = {}
-    for line in run(settings.openvpn, "status")[0].split("\n"):
+    for line in run(settings.service, "openvpn", "status")[0].split("\n"):
         x = re.search("'(?P<vpn>\\w+)'\\ is\\ (?P<running>not)?", line)
         if x:
             ret[x.group("vpn")] = x.group("running") != "not"
@@ -50,11 +52,11 @@ def vpn_status():
 
 def vpn_enable(name):
     """Start a VPN."""
-    run(settings.openvpn, "start", name)
+    run(settings.service, "openvpn", "start", name)
 
 def vpn_disable(name):
     """Stop a running VPN."""
-    run(settings.openvpn, "stop", name)
+    run(settings.service, "openvpn", "stop", name)
 
 def forward_drop():
     """Disable any and all forwarding unless explicitly said so."""
@@ -67,8 +69,9 @@ def enable_nat(interface):
 
 def disable_nat(interface):
     """Disable NAT on this interface."""
-    run(settings.iptables, "-t", "nat", "-D", "POSTROUTING",
-        "-o", interface, "-j", "MASQUERADE")
+    while not run(settings.iptables, "-t", "nat", "-D", "POSTROUTING",
+                  "-o", interface, "-j", "MASQUERADE")[1]:
+        pass
 
 def init_rttable(rt_table, interface):
     """Initialise routing table for this interface using routes
@@ -136,20 +139,30 @@ handlers = {
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("socket", nargs="?", default="/tmp/cuckoo-rooter", help="Unix socket path")
-    parser.add_argument("-g", "--group", default="cuckoo", help="Unix socket group")
-    parser.add_argument("--ifconfig", default="/sbin/ifconfig", help="Path to ifconfig")
-    parser.add_argument("--openvpn", default="/etc/init.d/openvpn", help="Path to openvpn")
-    parser.add_argument("--iptables", default="/sbin/iptables", help="Path to iptables")
+    parser.add_argument("socket", nargs="?", default="/tmp/cuckoo-rooter",
+                        help="Unix socket path")
+    parser.add_argument("-g", "--group", default="cuckoo",
+                        help="Unix socket group")
+    parser.add_argument("--ifconfig", default="/sbin/ifconfig",
+                        help="Path to ifconfig")
+    parser.add_argument("--service", default="/usr/sbin/service",
+                        help="Service wrapper script for invoking OpenVPN")
+    parser.add_argument("--iptables", default="/sbin/iptables",
+                        help="Path to iptables")
     parser.add_argument("--ip", default="/sbin/ip", help="Path to ip")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable verbose logging")
     settings = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger("cuckoo-rooter")
 
-    if not settings.openvpn or not os.path.exists(settings.openvpn):
-        sys.exit("OpenVPN binary is not available, please configure!")
+    if not settings.service or not os.path.exists(settings.service):
+        sys.exit(
+            "The service binary is not available, please configure it!\n"
+            "Note that on CentOS you should provide --service /sbin/service, "
+            "rather than using the Ubuntu/Debian default /usr/sbin/service."
+        )
 
     if not settings.ifconfig or not os.path.exists(settings.ifconfig):
         sys.exit("The `ifconfig` binary is not available, eh?!")

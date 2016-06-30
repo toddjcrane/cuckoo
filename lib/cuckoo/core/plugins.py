@@ -13,13 +13,14 @@ from distutils.version import StrictVersion
 
 from lib.cuckoo.common.abstracts import Auxiliary, Machinery, LibVirtMachinery, Processing
 from lib.cuckoo.common.abstracts import Report, Signature
-from lib.cuckoo.common.config import Config, parse_options
+from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT, CUCKOO_VERSION
 from lib.cuckoo.common.exceptions import CuckooCriticalError
 from lib.cuckoo.common.exceptions import CuckooOperationalError
 from lib.cuckoo.common.exceptions import CuckooProcessingError
 from lib.cuckoo.common.exceptions import CuckooReportError
 from lib.cuckoo.common.exceptions import CuckooDependencyError
+from lib.cuckoo.common.exceptions import CuckooDisableModule
 
 log = logging.getLogger(__name__)
 
@@ -96,9 +97,11 @@ def list_plugins(group=None):
 class RunAuxiliary(object):
     """Auxiliary modules manager."""
 
-    def __init__(self, task, machine):
+    def __init__(self, task, machine, guest_manager):
         self.task = task
         self.machine = machine
+        self.guest_manager = guest_manager
+
         self.cfg = Config("auxiliary")
         self.enabled = []
 
@@ -127,12 +130,15 @@ class RunAuxiliary(object):
 
             current.set_task(self.task)
             current.set_machine(self.machine)
+            current.set_guest_manager(self.guest_manager)
             current.set_options(options)
 
             try:
                 current.start()
             except NotImplementedError:
                 pass
+            except CuckooDisableModule:
+                continue
             except Exception as e:
                 log.warning("Unable to start auxiliary module %s: %s",
                             module_name, e)
@@ -140,6 +146,27 @@ class RunAuxiliary(object):
                 log.debug("Started auxiliary module: %s",
                           current.__class__.__name__)
                 self.enabled.append(current)
+
+    def callback(self, name, *args, **kwargs):
+        def default(*args, **kwargs):
+            pass
+
+        enabled = []
+        for module in self.enabled:
+            try:
+                getattr(module, "cb_%s" % name, default)(*args, **kwargs)
+            except NotImplementedError:
+                pass
+            except CuckooDisableModule:
+                continue
+            except Exception as e:
+                log.warning(
+                    "Error performing callback %r on auxiliary module %r: %s",
+                    name, module.__class__.__name__, e
+                )
+
+            enabled.append(module)
+        self.enabled = enabled
 
     def stop(self):
         for module in self.enabled:
@@ -406,7 +433,7 @@ class RunSignatures(object):
 
             # Initialize a list of signatures to call for this API call.
             if call["api"] not in self.api_sigs:
-                self.init_api_sigs(call["api"], call["category"])
+                self.init_api_sigs(call["api"], call.get("category"))
 
             # See the following SO answer on why we're using reversed() here.
             # http://stackoverflow.com/a/10665800
@@ -465,8 +492,6 @@ class RunReporting(object):
         self.results = results
         self.analysis_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task["id"]))
         self.cfg = Config("reporting")
-
-        self.task["options"] = parse_options(self.task["options"])
 
     def process(self, module):
         """Run a single reporting module.

@@ -8,13 +8,13 @@ import json
 import logging
 from datetime import datetime
 
-from lib.cuckoo.common.config import Config
+from lib.cuckoo.common.config import Config, parse_options, emit_options
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooDatabaseError
 from lib.cuckoo.common.exceptions import CuckooOperationalError
 from lib.cuckoo.common.exceptions import CuckooDependencyError
-from lib.cuckoo.common.objects import File, URL
-from lib.cuckoo.common.utils import create_folder, Singleton, classlock, SuperLock
+from lib.cuckoo.common.objects import File, URL, Dictionary
+from lib.cuckoo.common.utils import create_folder, Singleton, classlock, SuperLock, json_encode
 
 try:
     from sqlalchemy import create_engine, Column, not_
@@ -23,10 +23,12 @@ try:
     from sqlalchemy.ext.declarative import declarative_base
     from sqlalchemy.exc import SQLAlchemyError, IntegrityError
     from sqlalchemy.orm import sessionmaker, relationship, joinedload
+    from sqlalchemy.ext.hybrid import hybrid_property
     Base = declarative_base()
 except ImportError:
-    raise CuckooDependencyError("Unable to import sqlalchemy "
-                                "(install with `pip install sqlalchemy`)")
+    raise CuckooDependencyError(
+        "Unable to import sqlalchemy (install with `pip install sqlalchemy`)"
+    )
 
 log = logging.getLogger(__name__)
 
@@ -272,7 +274,7 @@ class Task(Base):
     package = Column(String(255), nullable=True)
     tags = relationship("Tag", secondary=tasks_tags, single_parent=True,
                         backref="task", lazy="subquery")
-    options = Column(String(255), nullable=True)
+    _options = Column("options", String(255), nullable=True)
     platform = Column(String(255), nullable=True)
     memory = Column(Boolean, nullable=False, default=False)
     enforce_timeout = Column(Boolean, nullable=False, default=False)
@@ -296,27 +298,49 @@ class Task(Base):
     guest = relationship("Guest", uselist=False, backref="tasks", cascade="save-update, delete")
     errors = relationship("Error", backref="tasks", cascade="save-update, delete")
 
+    def duration(self):
+        if self.started_on and self.completed_on:
+            return (self.completed_on - self.started_on).seconds
+        return -1
+
+    @hybrid_property
+    def options(self):
+        if not self._options:
+            return {}
+        return parse_options(self._options)
+
+    @options.setter
+    def options(self, value):
+        self._options = value
+
     def to_dict(self):
         """Converts object to dict.
         @return: dict
         """
-        d = {}
+        d = Dictionary()
         for column in self.__table__.columns:
             value = getattr(self, column.name)
-            if isinstance(value, datetime):
-                d[column.name] = value.strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                d[column.name] = value
+            d[column.name] = value
 
         # Tags are a relation so no column to iterate.
         d["tags"] = [tag.name for tag in self.tags]
+        d["duration"] = self.duration()
+        d["guest"] = {}
+
+        if self.guest:
+            # Get machine description.
+            d["guest"] = machine = self.guest.to_dict()
+            # Remove superfluous fields.
+            del machine["task_id"]
+            del machine["id"]
+
         return d
 
     def to_json(self):
         """Converts object to JSON.
         @return: JSON data
         """
-        return json.dumps(self.to_dict())
+        return json_encode(self.to_dict())
 
     def __init__(self, target=None):
         self.target = target
@@ -405,10 +429,11 @@ class Database(object):
             tmp_session.close()
             if last.version_num != SCHEMA_VERSION and schema_check:
                 raise CuckooDatabaseError(
-                    "DB schema version mismatch: found {0}, expected {1}. "
+                    "DB schema version mismatch: found %s, expected %s. "
                     "Try to apply all migrations (cd utils/db_migration/ && "
-                    "alembic upgrade head).".format(last.version_num,
-                                                    SCHEMA_VERSION))
+                    "alembic upgrade head)." %
+                    (last.version_num, SCHEMA_VERSION)
+                )
 
     def __del__(self):
         """Disconnects pool."""
@@ -431,9 +456,10 @@ class Database(object):
                 self.engine = create_engine(connection_string)
         except ImportError as e:
             lib = e.message.split()[-1]
-            raise CuckooDependencyError("Missing database driver, unable to "
-                                        "import %s (install with `pip "
-                                        "install %s`)" % (lib, lib))
+            raise CuckooDependencyError(
+                "Missing database driver, unable to import %s (install with "
+                "`pip install %s`)" % (lib, lib)
+            )
 
     def _get_or_create(self, session, model, **kwargs):
         """Get an ORM instance or create it if not exist.
@@ -726,7 +752,7 @@ class Database(object):
                 machines = machines.filter_by(platform=platform)
             if tags:
                 for tag in tags:
-                    machines = machines.filter(Machine.tags.any(name=tag.name))
+                    machines = machines.filter(Machine.tags.any(name=tag))
 
             # Check if there are any machines that satisfy the
             # selection requirements.
@@ -1045,21 +1071,62 @@ class Database(object):
         return self.add(None, timeout=timeout, priority=999, owner=owner,
                         tags=tags, category="service")
 
+    def add_reboot(self, task_id, timeout=0, options="", priority=1,
+                   owner="", machine="", platform="", tags=None, memory=False,
+                   enforce_timeout=False, clock=None):
+        """Add a reboot task to database from an existing analysis.
+        @param task_id: task id of existing analysis.
+        @param timeout: selected timeout.
+        @param options: analysis options.
+        @param priority: analysis priority.
+        @param owner: task owner.
+        @param machine: selected machine.
+        @param platform: platform.
+        @param tags: tags for machine selection
+        @param memory: toggle full memory dump.
+        @param enforce_timeout: toggle full timeout execution.
+        @param clock: virtual machine clock time
+        @return: cursor or None.
+        """
+
+        # Convert empty strings and None values to a valid int
+        if not timeout:
+            timeout = 0
+        if not priority:
+            priority = 1
+
+        task = self.view_task(task_id)
+        if not task or not os.path.exists(task.target):
+            log.error(
+                "Unable to add reboot analysis as the original task or its "
+                "sample has already been deleted."
+            )
+            return
+
+        # TODO Integrate the Reboot screen with the submission portal and
+        # pass the parent task ID through as part of the "options".
+        custom = "%s" % task_id
+
+        return self.add(File(task.target), timeout, "reboot", options,
+                        priority, custom, owner, machine, platform, tags,
+                        memory, enforce_timeout, clock, "file")
+
     @classlock
-    def reschedule(self, task_id):
+    def reschedule(self, task_id, priority=None):
         """Reschedule a task.
         @param task_id: ID of the task to reschedule.
         @return: ID of the newly created task.
         """
         task = self.view_task(task_id)
-
         if not task:
-            return None
+            return
 
         if task.category == "file":
             add = self.add_path
         elif task.category == "url":
             add = self.add_url
+        else:
+            return
 
         # Change status to recovered.
         session = self.Session()
@@ -1079,12 +1146,17 @@ class Database(object):
         else:
             tags = task.tags
 
-        return add(task.target, task.timeout, task.package, task.options,
+        # Assign a new priority.
+        if priority:
+            task.priority = priority
+
+        options = emit_options(task.options)
+        return add(task.target, task.timeout, task.package, options,
                    task.priority, task.custom, task.owner, task.machine,
                    task.platform, tags, task.memory, task.enforce_timeout,
                    task.clock)
 
-    def list_tasks(self, limit=None, details=False, category=None, owner=None,
+    def list_tasks(self, limit=None, details=True, category=None, owner=None,
                    offset=None, status=None, sample_id=None, not_status=None,
                    completed_after=None, order_by=None):
         """Retrieve list of task.
@@ -1152,7 +1224,7 @@ class Database(object):
             session.close()
 
     @classlock
-    def view_task(self, task_id, details=False):
+    def view_task(self, task_id, details=True):
         """Retrieve information on a task.
         @param task_id: ID of the task to query.
         @return: details on the task.
@@ -1334,7 +1406,5 @@ class Database(object):
             return task[0] if task else None
         except SQLAlchemyError as e:
             log.debug("Database error getting new processing tasks: %s", e)
-            return
         finally:
             session.close()
-        return

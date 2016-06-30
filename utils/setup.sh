@@ -222,7 +222,9 @@ EOF
     fi
 
     # Add the Suricata reboot crontab entry.
-    (crontab -l ; echo @reboot /opt/cuckoo/utils/suricata.sh)|crontab -
+    if ! grep suricata.sh <(crontab -l); then
+        (crontab -l ; echo @reboot /opt/cuckoo/utils/suricata.sh)|crontab -
+    fi
 
     # Delete the cuckoo1 machine that is included in the VirtualBox
     # configuration by default.
@@ -260,7 +262,7 @@ _setup() {
         libpq-dev python-dpkt vim tcpdump libcap2-bin genisoimage pwgen \
         htop tig mosh mongodb uwsgi uwsgi-plugin-python nginx virtualbox-4.3 \
         libffi-dev libxml2-dev libxslt1-dev libjpeg-dev samba-common-bin \
-        ethtool elasticsearch
+        ethtool elasticsearch linux-headers-$(uname -r)
 
     # Create the main postgresql cluster. In recent versions of Ubuntu Server
     # 14.04 you have to do this manually. If it already exists this command

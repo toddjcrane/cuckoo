@@ -4,6 +4,7 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import hashlib
+import logging
 import os
 import sys
 import shutil
@@ -12,9 +13,13 @@ import string
 import tempfile
 import xmlrpclib
 import inspect
+import platform
 import threading
+import json
 import multiprocessing
+import warnings
 
+from cStringIO import StringIO
 from datetime import datetime
 
 from lib.cuckoo.common.exceptions import CuckooOperationalError
@@ -24,10 +29,24 @@ from lib.cuckoo.common.constants import CUCKOO_ROOT, CUCKOO_VERSION
 from lib.cuckoo.common.constants import GITHUB_URL, ISSUES_PAGE_URL
 
 try:
+    import bs4
+    HAVE_BS4 = True
+except ImportError:
+    HAVE_BS4 = False
+
+try:
     import chardet
     HAVE_CHARDET = True
 except ImportError:
     HAVE_CHARDET = False
+
+try:
+    import jsbeautifier
+    HAVE_JSBEAUTIFIER = True
+except ImportError:
+    HAVE_JSBEAUTIFIER = False
+
+log = logging.getLogger(__name__)
 
 def create_folders(root=".", folders=[]):
     """Create directories.
@@ -297,20 +316,46 @@ def md5_file(filepath):
 def sha1_file(filepath):
     return hash_file(hashlib.sha1, filepath)
 
+GUIDS = {}
+
+def guid_name(guid):
+    if not GUIDS:
+        for line in open(os.path.join(CUCKOO_ROOT, "data", "guids.txt")):
+            try:
+                guid, name, url = line.strip().split()
+            except:
+                log.debug("Invalid GUID entry: %s", line)
+                continue
+
+            GUIDS["{%s}" % guid] = name
+
+    return GUIDS.get(guid)
+
 def exception_message():
     """Creates a message describing an unhandled exception."""
+    def get_os_release():
+        """Returns detailed OS release."""
+        if platform.linux_distribution()[0]:
+            return " ".join(platform.linux_distribution())
+        elif platform.mac_ver()[0]:
+            return "%s %s" % (platform.mac_ver()[0], platform.mac_ver()[2])
+        else:
+            return "Unknown"
+
     msg = (
         "Oops! Cuckoo failed in an unhandled exception!\nSometimes bugs are "
         "already fixed in the development release, it is therefore "
         "recommended to retry with the latest development release available "
-        "%s\nIf the error persists please open a new issue at %s\n\n" % \
+        "%s\nIf the error persists please open a new issue at %s\n\n" %
         (GITHUB_URL, ISSUES_PAGE_URL)
     )
 
     msg += "=== Exception details ===\n"
     msg += "Cuckoo version: %s\n" % CUCKOO_VERSION
     msg += "OS version: %s\n" % os.name
+    msg += "OS release: %s\n" % get_os_release()
     msg += "Python version: %s\n" % sys.version.split()[0]
+    msg += "Machine arch: %s\n" % platform.machine()
 
     git_version = os.path.join(CUCKOO_ROOT, ".git", "refs", "heads", "master")
     if os.path.exists(git_version):
@@ -331,3 +376,63 @@ def exception_message():
 
     msg += "\n"
     return msg
+
+_jsbeautify_blacklist = [
+    "",
+    "error: Unknown p.a.c.k.e.r. encoding.\n",
+]
+
+_jsbeautify_lock = threading.Lock()
+
+def jsbeautify(javascript):
+    """Beautifies Javascript through jsbeautifier and ignore some messages."""
+    if not HAVE_JSBEAUTIFIER:
+        return javascript
+
+    with _jsbeautify_lock:
+        origout, sys.stdout = sys.stdout, StringIO()
+        javascript = jsbeautifier.beautify(javascript)
+
+        if sys.stdout.getvalue() not in _jsbeautify_blacklist:
+            log.warning("jsbeautifier returned error: %s", sys.stdout.getvalue())
+
+        sys.stdout = origout
+    return javascript
+
+def htmlprettify(html):
+    """Beautifies HTML through BeautifulSoup4."""
+    if not HAVE_BS4:
+        return html
+
+    # The following ignores the following bs4 warning:
+    # UserWarning: "." looks like a filename, not markup.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", lineno=182)
+        return bs4.BeautifulSoup(html, "html.parser").prettify()
+
+def json_default(obj):
+    """JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, datetime):
+        if obj.utcoffset() is not None:
+            obj = obj - obj.utcoffset()
+        return {"$dt": obj.isoformat()}
+    raise TypeError("Type not serializable")
+
+def json_hook(obj):
+    """JSON object hook, deserializing datetimes ($date)"""
+    if "$dt" in obj:
+        x = obj["$dt"]
+        return datetime.strptime(x, "%Y-%m-%dT%H:%M:%S.%f")
+    return obj
+
+def json_encode(obj, **kwargs):
+    """JSON encoding wrapper that handles datetime objects"""
+    return json.dumps(obj, default=json_default, **kwargs)
+
+def json_decode(x):
+    """JSON decoder that does ugly first-level datetime handling"""
+    return json.loads(x, object_hook=json_hook)
+
+def versiontuple(v):
+    """Return the version as a tuple for easy comparison."""
+    return tuple(int(x) for x in v.split("."))

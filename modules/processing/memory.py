@@ -11,6 +11,8 @@ from lib.cuckoo.common.abstracts import Processing
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 
+log = logging.getLogger(__name__)
+
 try:
     import volatility.conf as conf
     import volatility.registry as registry
@@ -33,10 +35,14 @@ try:
     rootlogger = logging.getLogger()
     logging.getLogger("volatility.obj").setLevel(rootlogger.level)
     logging.getLogger("volatility.utils").setLevel(rootlogger.level)
-except ImportError:
-    HAVE_VOLATILITY = False
+except ImportError as e:
+    if e.message == "No module named Crypto.Hash":
+        log.error(
+            "The PyCrypto package is missing (install with "
+            "`pip install pycrypto`)"
+        )
 
-log = logging.getLogger(__name__)
+    HAVE_VOLATILITY = False
 
 class VolatilityAPI(object):
     """ Volatility API interface."""
@@ -911,7 +917,7 @@ class VolatilityManager(object):
 
         conf_path = os.path.join(CUCKOO_ROOT, "conf", "memory.conf")
         if not os.path.exists(conf_path):
-            log.error("Configuration file volatility.conf not found".format(conf_path))
+            log.error("Configuration file {0} not found".format(conf_path))
             self.voptions = False
             return
 

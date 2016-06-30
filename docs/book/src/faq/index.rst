@@ -19,7 +19,7 @@ General Questions
 Can I analyze URLs with Cuckoo?
 -------------------------------
 
-Yes you can. Since version 0.5 URLs are natively supported by Cuckoo. 
+Yes you can. Since version 0.5 URLs are natively supported by Cuckoo.
 Additional details on how URL submissions is documented :doc:`../usage/submit.html#submission-utility`.
 
 
@@ -43,13 +43,13 @@ analysis would be polluted by the sandbox's components.
 
 .. _esxi_reqs:
 
-What I need to use Cuckoo with VMware ESXi?
--------------------------------------------
+What do I need to use Cuckoo with VMware ESXi?
+----------------------------------------------
 
-To run with VMware vSphere Hypervisor (or ESXi) Cuckoo levareges on libvirt.
-Libivirt is currently using VMware API to take control over virtual machines,
-althogh these API are available ony in licensed version.
-In VMware vSphere free edition, these API are read only, so you are unable
+To run with VMware vSphere Hypervisor (or ESXi) Cuckoo leverages libvirt.
+Libivirt is currently using the VMware API to take control over virtual machines,
+though these APIs are available only in the licensed version.
+In VMware vSphere free edition, these APIs are read only, so you are unable
 to use Cuckoo with it.
 For the minimum license needed, please have a look at VMware website.
 
@@ -165,8 +165,8 @@ If the state is "powered off" you can go ahead with the next check, if the state
 With the following check the current snapshots state::
 
     $ VBoxManage snapshot "<Name of VM>" list --details
-       Name: s1 (UUID: 90828a77-72f4-4a5e-b9d3-bb1fdd4cef5f)
-          Name: s2 (UUID: 97838e37-9ca4-4194-a041-5e9a40d6c205) *
+    Name: s1 (UUID: 90828a77-72f4-4a5e-b9d3-bb1fdd4cef5f)
+    Name: s2 (UUID: 97838e37-9ca4-4194-a041-5e9a40d6c205) *
 
 If you have a snapshot marked with a star "*" your snapshot is ready, anyway
 you have to restore the current snapshot::
@@ -187,3 +187,62 @@ with the result server IP address.
 You can bring it up manually, it depends from one virtualization software to another, but
 if you don't know how to do, a good trick is to manually start and stop an analysis virtual
 machine, this will bring virtual networking up.
+
+In the case of VirtualBox the hostonly interface `vboxnet0` can be created as follows::
+
+    # If the hostonly interface vboxnet0 does not exist already.
+    $ VBoxManage hostonlyif create
+
+    # Configure vboxnet0.
+    $ VBoxManage hostonlyif ipconfig vboxnet0 --ip 192.168.56.1 --netmask 255.255.255.0
+
+Error during template rendering
+-------------------------------
+
+.. versionchanged:: 2.0-rc1
+
+In our 2.0-rc1 release a bug was introduced that looks as follows in the
+screenshot below. In order to resolve this issue in your local setup, please
+open the ``web/analysis/urls.py`` file and modify the 21st line by adding an
+underscore as follows::
+
+     -        "/(?P<ip>[\d\.]+)?/(?P<host>[a-zA-Z0-9-\.]+)?"
+     +        "/(?P<ip>[\d\.]+)?/(?P<host>[ a-zA-Z0-9-_\.]+)?"
+
+The official fixes for this issue can be found in the `following`_ `commits`_.
+
+.. _`following`: https://github.com/cuckoosandbox/cuckoo/commit/9c704f50e70227ed21ae1b79ba90540c3087fc57
+.. _`commits`: https://github.com/cuckoosandbox/cuckoo/commit/558ded1787bc3377c404ac14a0b3fdce37b49bf4
+
+.. image:: ../_images/screenshots/error_template_rendering.png
+
+501 Unsupported Method ('GET')
+------------------------------
+
+.. versionchanged:: 2.0-rc1
+
+Since 2.0-rc1 Cuckoo supports both the `legacy Cuckoo Agent`_ as well as a
+`new, REST API-based, Cuckoo Agent`_ for communication between the Guest and
+the Host machine. The new ``Cuckoo Agent`` is an improved Agent in the sense
+that it also allows usage outside of Cuckoo. As an example, it is used
+extensively by `VMCloak`_ in order to automatically create, configure, and
+cloak Virtual Machines.
+
+Now in order to determine whether the Cuckoo Host is talking to the legacy or
+new ``Cuckoo Agent`` it does a ``HTTP GET`` request to the root path (``/``).
+The legacy Cuckoo Agent, which is based on ``xmlrpc``, doesn't handle that
+specific route and therefore returns an error, ``501 Unsupported method``.
+
+Having said that, the message is not actually an error, it is simply Cuckoo
+trying to determine to which version of the ``Cuckoo Agent`` it is talking.
+
+.. note::
+    It should be noted that even though there is a new ``Cuckoo Agent``
+    available, backwards compatibility for the legacy ``Cuckoo Agent`` is
+    still available and working properly.
+
+.. image:: ../_images/screenshots/unsupported_method.png
+
+.. _`legacy Cuckoo Agent`: https://github.com/cuckoosandbox/cuckoo/blob/master/agent/agent.py
+.. _`new, REST API-based, Cuckoo Agent`: https://github.com/jbremer/agent/blob/master/agent.py
+.. _`VMCloak`: https://github.com/jbremer/vmcloak

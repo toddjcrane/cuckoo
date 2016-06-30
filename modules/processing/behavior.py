@@ -4,6 +4,7 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import collections
+import json
 import logging
 import os
 
@@ -83,8 +84,10 @@ class ProcessTree(BehaviorHandler):
 
     def handle_event(self, process):
         if process["pid"] in self.processes:
-            log.warning("Found the same process identifier twice, this "
-                        "shouldn't happen!")
+            log.warning(
+                "Found the same process identifier twice, this "
+                "shouldn't happen!"
+            )
             return
 
         self.processes[process["pid"]] = {
@@ -94,7 +97,7 @@ class ProcessTree(BehaviorHandler):
             "command_line": process.get("command_line"),
             "first_seen": process["first_seen"],
             "children": [],
-            "track": process["track"],
+            "track": process.get("track", True),
         }
 
     def run(self):
@@ -123,6 +126,7 @@ class GenericBehavior(BehaviorHandler):
             "pid": process["pid"],
             "ppid": process["ppid"],
             "process_name": process["process_name"],
+            "process_path": process["process_path"],
             "first_seen": process["first_seen"],
             "summary": collections.defaultdict(set),
         }
@@ -169,6 +173,29 @@ class PlatformInfo(BehaviorHandler):
     #     "architecture": "unknown", # look this up in the task / vm info?
     #     "source": ["monitor", "windows"],
     # }
+
+class RebootInformation(BehaviorHandler):
+    """Provides specific information useful for reboot analysis.
+
+    In reality this is not a true BehaviorHandler as it doesn't return any
+    data into the JSON report, but instead it writes a log file which will be
+    interpreted when doing a reboot analysis.
+    """
+
+    event_types = ["reboot"]
+
+    def __init__(self, *args, **kwargs):
+        super(RebootInformation, self).__init__(*args, **kwargs)
+        self.events = []
+
+    def handle_event(self, event):
+        self.events.append((event["time"], event))
+
+    def run(self):
+        reboot_path = os.path.join(self.analysis.analysis_path, "reboot.json")
+        with open(reboot_path, "wb") as f:
+            for ts, event in sorted(self.events):
+                f.write("%s\n" % json.dumps(event))
 
 class BehaviorAnalysis(Processing):
     """Behavior Analyzer.
@@ -272,6 +299,9 @@ class BehaviorAnalysis(Processing):
             # platform specific stuff
             WindowsMonitor(self),
             LinuxSystemTap(self),
+
+            # Reboot information.
+            RebootInformation(self),
         ]
 
         # doesn't really work if there's no task, let's rely on the file name for now

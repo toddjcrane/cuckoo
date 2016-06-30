@@ -3,6 +3,7 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import hashlib
 import logging
 import json
 import os
@@ -14,10 +15,11 @@ import urlparse
 
 from lib.cuckoo.common.abstracts import Processing
 from lib.cuckoo.common.config import Config
+from lib.cuckoo.common.constants import LATEST_HTTPREPLAY
 from lib.cuckoo.common.dns import resolve
 from lib.cuckoo.common.irc import ircMessage
 from lib.cuckoo.common.objects import File
-from lib.cuckoo.common.utils import convert_to_printable
+from lib.cuckoo.common.utils import convert_to_printable, versiontuple
 from lib.cuckoo.common.exceptions import CuckooProcessingError
 
 try:
@@ -50,6 +52,19 @@ Packet = namedtuple("Packet", ["raw", "ts"])
 log = logging.getLogger(__name__)
 cfg = Config()
 
+# Urge users to upgrade to the latest version.
+_v = getattr(httpreplay, "__version__", None) if HAVE_HTTPREPLAY else None
+if _v and versiontuple(_v) < versiontuple(LATEST_HTTPREPLAY):
+    log.warning(
+        "You are using version %s of HTTPReplay, rather than the latest "
+        "version %s, which may not handle various corner cases and/or TLS "
+        "cipher suites correctly. This could result in not getting all the "
+        "HTTP/HTTPS streams that are available or corrupt some streams that "
+        "were not handled correctly before. Please upgrade it to the latest "
+        "version (`pip install --upgrade httpreplay`).",
+        _v, LATEST_HTTPREPLAY,
+    )
+
 class Pcap(object):
     """Reads network data from PCAP file."""
     ssl_ports = 443,
@@ -75,6 +90,7 @@ class Pcap(object):
         # addresses that are no longer available.
         self.tcp_connections_dead = {}
         self.dead_hosts = {}
+        self.alive_hosts = {}
         # List containing all UDP packets.
         self.udp_connections = []
         self.udp_connections_seen = set()
@@ -282,7 +298,7 @@ class Pcap(object):
             query["request"] = q_name
             if q_type == dpkt.dns.DNS_A:
                 query["type"] = "A"
-            if q_type == dpkt.dns.DNS_AAAA:
+            elif q_type == dpkt.dns.DNS_AAAA:
                 query["type"] = "AAAA"
             elif q_type == dpkt.dns.DNS_CNAME:
                 query["type"] = "CNAME"
@@ -607,6 +623,8 @@ class Pcap(object):
                         if not ((dst, dport, src, sport) in self.tcp_connections_seen or (src, sport, dst, dport) in self.tcp_connections_seen):
                             self.tcp_connections.append((src, sport, dst, dport, offset, ts-first_ts))
                             self.tcp_connections_seen.add((src, sport, dst, dport))
+
+                        self.alive_hosts[dst, dport] = True
                     else:
                         ipconn = (
                             connection["src"], tcp.sport,
@@ -669,11 +687,14 @@ class Pcap(object):
         self.results["dead_hosts"] = []
 
         # Report each IP/port combination as a dead host if we've had to retry
-        # at least 3 times to connect to it. TODO We should remove the IP/port
-        # combination from the list if the connection was successful later on
-        # during the analysis.
+        # at least 3 times to connect to it and if no successful connections
+        # were detected throughout the analysis.
         for (ip, port), count in self.dead_hosts.items():
-            if count > 2 and (ip, port) not in self.results["dead_hosts"]:
+            if count < 3 or (ip, port) in self.alive_hosts:
+                continue
+
+            # Report once.
+            if (ip, port) not in self.results["dead_hosts"]:
                 self.results["dead_hosts"].append((ip, port))
 
         return self.results
@@ -683,8 +704,9 @@ class Pcap2(object):
     the various protocols, decrypts and decodes them, and then provides us
     with the high level representation of it."""
 
-    def __init__(self, pcap_path, tlsmaster):
+    def __init__(self, pcap_path, tlsmaster, network_path):
         self.pcap_path = pcap_path
+        self.network_path = network_path
 
         self.handlers = {
             25: httpreplay.cut.smtp_handler,
@@ -701,20 +723,38 @@ class Pcap2(object):
             "https_ex": [],
         }
 
-        r = httpreplay.reader.PcapReader(self.pcap_path)
+        if not os.path.exists(self.network_path):
+            os.mkdir(self.network_path)
+
+        r = httpreplay.reader.PcapReader(open(self.pcap_path, "rb"))
         r.tcp = httpreplay.smegma.TCPPacketStreamer(r, self.handlers)
 
-        for s, ts, protocol, sent, recv in r.process():
+        l = sorted(r.process(), key=lambda x: x[1])
+        for s, ts, protocol, sent, recv in l:
             srcip, srcport, dstip, dstport = s
 
             if protocol == "http" or protocol == "https":
+                request = sent.raw.split("\r\n\r\n", 1)[0]
+                response = recv.raw.split("\r\n\r\n", 1)[0]
+
+                md5 = hashlib.md5(recv.body or "").hexdigest()
+                sha1 = hashlib.sha1(recv.body or "").hexdigest()
+
+                filepath = os.path.join(self.network_path, sha1)
+                open(filepath, "wb").write(recv.body or "")
+
                 results["%s_ex" % protocol].append({
                     "src": srcip, "sport": srcport,
                     "dst": dstip, "dport": dstport,
+                    "protocol": protocol,
+                    "method": sent.method,
                     "host": sent.headers.get("host", dstip),
                     "uri": sent.uri,
-                    "request": sent.raw.split("\r\n\r\n", 1)[0],
-                    "response": recv.raw.split("\r\n\r\n", 1)[0],
+                    "request": request.decode("latin-1"),
+                    "response": response.decode("latin-1"),
+                    "md5": md5,
+                    "sha1": sha1,
+                    "path": filepath,
                 })
 
         return results
@@ -771,7 +811,8 @@ class NetworkAnalysis(Processing):
 
         if HAVE_HTTPREPLAY and os.path.exists(pcap_path):
             try:
-                results.update(Pcap2(pcap_path, self.get_tlsmaster()).run())
+                p2 = Pcap2(pcap_path, self.get_tlsmaster(), self.network_path)
+                results.update(p2.run())
             except:
                 log.exception("Error running httpreplay-based PCAP analysis")
 

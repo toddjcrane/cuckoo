@@ -3,6 +3,7 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import datetime
 import os
 import sys
 import socket
@@ -15,13 +16,13 @@ import traceback
 import urllib
 import urllib2
 import xmlrpclib
-from datetime import datetime
 
 from lib.api.process import Process
 from lib.common.abstracts import Package, Auxiliary
 from lib.common.constants import SHUTDOWN_MUTEX
 from lib.common.defines import KERNEL32
 from lib.common.exceptions import CuckooError, CuckooPackageError
+from lib.common.exceptions import CuckooDisableModule
 from lib.common.hashing import hash_file
 from lib.common.rand import random_string
 from lib.common.results import upload_to_host
@@ -29,7 +30,7 @@ from lib.core.config import Config
 from lib.core.packages import choose_package
 from lib.core.pipe import PipeServer, PipeForwarder, PipeDispatcher
 from lib.core.privileges import grant_debug_privilege
-from lib.core.startup import init_logging
+from lib.core.startup import init_logging, set_clock
 from modules import auxiliary
 
 log = logging.getLogger("analyzer")
@@ -38,18 +39,34 @@ class Files(object):
     PROTECTED_NAMES = ()
 
     def __init__(self):
-        self.files = []
+        self.files = {}
+        self.files_orig = {}
         self.dumped = []
 
     def is_protected_filename(self, file_name):
         """Do we want to inject into a process with this name?"""
         return file_name.lower() in self.PROTECTED_NAMES
 
-    def add_file(self, filepath):
-        """Add filepath to the list of files."""
+    def add_pid(self, filepath, pid, verbose=True):
+        """Tracks a process identifier for this file."""
+        if not pid or filepath.lower() not in self.files:
+            return
+
+        if pid not in self.files[filepath.lower()]:
+            self.files[filepath.lower()].append(pid)
+            verbose and log.info("Added pid %s for %r", pid, filepath)
+
+    def add_file(self, filepath, pid=None):
+        """Add filepath to the list of files and track the pid."""
         if filepath.lower() not in self.files:
-            log.info("Added new file to list with path: %s", filepath)
-            self.files.append(filepath.lower())
+            log.info(
+                "Added new file to list with pid %s and path %s",
+                pid, filepath
+            )
+            self.files[filepath.lower()] = []
+            self.files_orig[filepath.lower()] = filepath
+
+        self.add_pid(filepath, pid, verbose=False)
 
     def dump_file(self, filepath):
         """Dump a file to the host."""
@@ -70,26 +87,35 @@ class Files(object):
         upload_path = os.path.join("files", filename)
 
         try:
-            upload_to_host(filepath, upload_path)
+            upload_to_host(
+                # If available use the original filepath, the one that is
+                # not lowercased.
+                self.files_orig.get(filepath.lower(), filepath),
+                upload_path, self.files.get(filepath.lower(), [])
+            )
             self.dumped.append(sha256)
         except (IOError, socket.error) as e:
-            log.error("Unable to upload dropped file at path \"%s\": %s",
-                      filepath, e)
+            log.error(
+                "Unable to upload dropped file at path \"%s\": %s",
+                filepath, e
+            )
 
-    def delete_file(self, filepath):
+    def delete_file(self, filepath, pid=None):
         """A file is about to removed and thus should be dumped right away."""
+        self.add_pid(filepath, pid)
         self.dump_file(filepath)
 
         # Remove the filepath from the files list.
-        if filepath.lower() in self.files:
-            self.files.remove(filepath.lower())
+        self.files.pop(filepath.lower(), None)
+        self.files_orig.pop(filepath.lower(), None)
 
-    def move_file(self, oldfilepath, newfilepath):
+    def move_file(self, oldfilepath, newfilepath, pid=None):
         """A file will be moved - track this change."""
+        self.add_pid(oldfilepath, pid)
         if oldfilepath.lower() in self.files:
             # Replace the entry with the new filepath.
-            index = self.files.index(oldfilepath.lower())
-            self.files[index] = newfilepath.lower()
+            self.files[newfilepath.lower()] = \
+                self.files.pop(oldfilepath.lower(), [])
 
     def dump_files(self):
         """Dump all pending files."""
@@ -149,6 +175,7 @@ class CommandPipeHandler(object):
 
     def __init__(self, analyzer):
         self.analyzer = analyzer
+        self.tracked = {}
 
     def _handle_debug(self, data):
         """Debug message from the monitor."""
@@ -249,7 +276,7 @@ class CommandPipeHandler(object):
             else:
                 proc.inject(dll, apc=False, mode="%s" % mode)
 
-            log.info("Injected into process with pid %s and name %s",
+            log.info("Injected into process with pid %s and name %r",
                      proc.pid, filename)
 
     def _handle_process(self, data):
@@ -280,13 +307,12 @@ class CommandPipeHandler(object):
 
     def _handle_file_new(self, data):
         """Notification of a new dropped file."""
-        # Extract the file path and add it to the list.
-        self.analyzer.files.add_file(data.decode("utf8"))
+        self.analyzer.files.add_file(data.decode("utf8"), self.pid)
 
     def _handle_file_del(self, data):
         """Notification of a file being removed - we have to dump it before
         it's being removed."""
-        self.analyzer.files.delete_file(data.decode("utf8"))
+        self.analyzer.files.delete_file(data.decode("utf8"), self.pid)
 
     def _handle_file_move(self, data):
         """A file is being moved - track these changes."""
@@ -296,8 +322,9 @@ class CommandPipeHandler(object):
             return
 
         old_filepath, new_filepath = data.split("::", 1)
-        self.analyzer.files.move_file(old_filepath.decode("utf8"),
-                                      new_filepath.decode("utf8"))
+        self.analyzer.files.move_file(
+            old_filepath.decode("utf8"), new_filepath.decode("utf8"), self.pid
+        )
 
     def _handle_kill(self, data):
         """A process is being killed."""
@@ -316,6 +343,41 @@ class CommandPipeHandler(object):
 
         Process(pid=int(data)).dump_memory()
 
+    def _handle_dumpreqs(self, data):
+        if not data.isdigit():
+            log.warning("Received DUMPREQS command with an incorrect argument %r.", data)
+            return
+
+        pid = int(data)
+
+        if pid not in self.tracked:
+            log.warning("Received DUMPREQS command but there are no reqs for pid %d.", pid)
+            return
+
+        dumpreqs = self.tracked[pid].get("dumpreq", [])
+        for addr, length in dumpreqs:
+            log.debug("tracked dump req (%r, %r, %r)", pid, addr, length)
+
+            if not addr or not length:
+                continue
+
+            Process(pid=pid).dump_memory_block(int(addr), int(length))
+
+    def _handle_track(self, data):
+        if not data.count(":") == 2:
+            log.warning("Received TRACK command with an incorrect argument %r.", data)
+            return
+
+        pid, scope, params = data.split(":", 2)
+        pid = int(pid)
+
+        paramtuple = params.split(",")
+        if pid not in self.tracked:
+            self.tracked[pid] = {}
+        if scope not in self.tracked[pid]:
+            self.tracked[pid][scope] = []
+        self.tracked[pid][scope].append(paramtuple)
+
     def dispatch(self, data):
         response = "NOPE"
 
@@ -323,14 +385,26 @@ class CommandPipeHandler(object):
             log.critical("Unknown command received from the monitor: %r",
                          data.strip())
         else:
-            command, arguments = data.strip().split(":", 1)
+            # Backwards compatibility (old syntax is, e.g., "FILE_NEW:" vs the
+            # new syntax, e.g., "1234:FILE_NEW:").
+            if data[0].isupper():
+                command, arguments = data.strip().split(":", 1)
+                self.pid = None
+            else:
+                self.pid, command, arguments = data.strip().split(":", 2)
 
-            if not hasattr(self, "_handle_%s" % command.lower()):
+            fn = getattr(self, "_handle_%s" % command.lower(), None)
+            if not fn:
                 log.critical("Unknown command received from the monitor: %r",
                              data.strip())
             else:
-                fn = getattr(self, "_handle_%s" % command.lower())
-                response = fn(arguments)
+                try:
+                    response = fn(arguments)
+                except:
+                    log.exception(
+                        "Pipe command handler exception occurred (command "
+                        "%s args %r).", command, arguments
+                    )
 
         return response
 
@@ -356,6 +430,8 @@ class Analyzer(object):
         self.process_list = ProcessList()
         self.package = None
 
+        self.reboot = []
+
     def prepare(self):
         """Prepare env for analysis."""
         # Get SeDebugPrivilege for the Python process. It will be needed in
@@ -372,17 +448,9 @@ class Analyzer(object):
         Process.set_config(self.config)
 
         # Set virtual machine clock.
-        clock = datetime.strptime(self.config.clock, "%Y%m%dT%H:%M:%S")
-
-        # Setting date and time.
-        # NOTE: Windows system has only localized commands with date format
-        # following localization settings, so these commands for english date
-        # format cannot work in other localizations.
-        # In addition DATE and TIME commands are blocking if an incorrect
-        # syntax is provided, so an echo trick is used to bypass the input
-        # request and not block analysis.
-        os.system("echo:|date {0}".format(clock.strftime("%m-%d-%y")))
-        os.system("echo:|time {0}".format(clock.strftime("%H:%M:%S")))
+        set_clock(datetime.datetime.strptime(
+            self.config.clock, "%Y%m%dT%H:%M:%S"
+        ))
 
         # Set the default DLL to be used for this analysis.
         self.default_dll = self.config.options.get("dll")
@@ -443,8 +511,9 @@ class Analyzer(object):
         @return: operation status.
         """
         self.prepare()
+        self.path = os.getcwd()
 
-        log.debug("Starting analyzer from: %s", os.getcwd())
+        log.debug("Starting analyzer from: %s", self.path)
         log.debug("Pipe server name: %s", self.config.pipe)
         log.debug("Log pipe server name: %s", self.config.logpipe)
 
@@ -498,7 +567,7 @@ class Analyzer(object):
                               "(package={0}): {1}".format(package_name, e))
 
         # Initialize the analysis package.
-        self.package = package_class(self.config.options)
+        self.package = package_class(self.config.options, analyzer=self)
 
         # Move the sample to the current working directory as provided by the
         # task - one is able to override the starting path of the sample.
@@ -531,13 +600,15 @@ class Analyzer(object):
                 aux.start()
             except (NotImplementedError, AttributeError):
                 log.warning("Auxiliary module %s was not implemented",
-                            aux.__class__.__name__)
+                            module.__name__)
+            except CuckooDisableModule:
+                continue
             except Exception as e:
                 log.warning("Cannot execute auxiliary module %s: %s",
-                            aux.__class__.__name__, e)
+                            module.__name__, e)
             else:
                 log.debug("Started auxiliary module %s",
-                          aux.__class__.__name__)
+                          module.__name__)
                 aux_enabled.append(aux)
 
         # Start analysis package. If for any reason, the execution of the
@@ -545,15 +616,20 @@ class Analyzer(object):
         try:
             pids = self.package.start(self.target)
         except NotImplementedError:
-            raise CuckooError("The package \"{0}\" doesn't contain a run "
-                              "function.".format(package_name))
+            raise CuckooError(
+                "The package \"%s\" doesn't contain a run function." %
+                package_name
+            )
         except CuckooPackageError as e:
-            raise CuckooError("The package \"{0}\" start function raised an "
-                              "error: {1}".format(package_name, e))
+            raise CuckooError(
+                "The package \"%s\" start function raised an error: %s" %
+                (package_name, e)
+            )
         except Exception as e:
-            raise CuckooError("The package \"{0}\" start function encountered "
-                              "an unhandled exception: "
-                              "{1}".format(package_name, e))
+            raise CuckooError(
+                "The package \"%s\" start function encountered an unhandled "
+                "exception: %s" % (package_name, e)
+            )
 
         # If the analysis package returned a list of process identifiers, we
         # add them to the list of monitored processes and enable the process monitor.
@@ -664,8 +740,7 @@ class Analyzer(object):
                             aux.__class__.__name__, e)
 
         if self.config.terminate_processes:
-            # Try to terminate remaining active processes. We do this to make sure
-            # that we clean up remaining open handles (sockets, files, etc.).
+            # Try to terminate remaining active processes.
             log.info("Terminating remaining processes before shutdown.")
 
             for pid in self.process_list.pids:

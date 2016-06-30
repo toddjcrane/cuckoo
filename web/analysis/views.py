@@ -3,11 +3,16 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import calendar
+import datetime
 import sys
 import re
 import os
 import json
 import urllib
+import zipfile
+
+from cStringIO import StringIO
 
 from django.conf import settings
 from django.http import HttpResponse
@@ -22,8 +27,9 @@ from gridfs import GridFS
 
 sys.path.append(settings.CUCKOO_PATH)
 
-from lib.cuckoo.core.database import Database, TASK_PENDING
-from lib.cuckoo.common.constants import CUCKOO_ROOT
+from lib.cuckoo.core.database import Database, TASK_PENDING, TASK_COMPLETED
+from lib.cuckoo.common.utils import store_temp_file, versiontuple
+from lib.cuckoo.common.constants import CUCKOO_ROOT, LATEST_HTTPREPLAY
 import modules.processing.network as network
 
 results_db = settings.MONGO
@@ -218,6 +224,19 @@ def search_behavior(request, task_id):
                         process_results.append(call)
                         break
 
+                    if isinstance(value, (tuple, list)):
+                        for arg in value:
+                            if not isinstance(arg, basestring):
+                                continue
+
+                            if query.search(arg):
+                                call["id"] = index
+                                process_results.append(call)
+                                break
+                        else:
+                            continue
+                        break
+
         if process_results:
             results.append({
                 "process": process,
@@ -253,11 +272,26 @@ def report(request, task_id):
     else:
         HAVE_HTTPREPLAY = False
 
+    try:
+        import httpreplay
+        httpreplay_version = getattr(httpreplay, "__version__", None)
+    except ImportError:
+        httpreplay_version = None
+
+    # Is this version of httpreplay deprecated?
+    deprecated = httpreplay_version and \
+        versiontuple(httpreplay_version) < versiontuple(LATEST_HTTPREPLAY)
+
     return render(request, "analysis/report.html", {
         "analysis": report,
         "domainlookups": domainlookups,
         "iplookups": iplookups,
-        "HAVE_HTTPREPLAY": HAVE_HTTPREPLAY,
+        "httpreplay": {
+            "have": HAVE_HTTPREPLAY,
+            "deprecated": deprecated,
+            "current_version": httpreplay_version,
+            "latest_version": LATEST_HTTPREPLAY,
+        },
     })
 
 @require_safe
@@ -357,6 +391,12 @@ def _search_helper(obj, k, value):
 @csrf_exempt
 def search(request):
     """New Search API using ElasticSearch as backend."""
+    if not settings.ELASTIC:
+        return render(request, "error.html", {
+            "error": "ElasticSearch is not enabled and therefore it is "
+                     "not possible to do a global search.",
+        })
+
     if request.method == "GET":
         return render(request, "analysis/search.html")
 
@@ -364,13 +404,16 @@ def search(request):
 
     match_value = ".*".join(re.split("[^a-zA-Z0-9]+", value.lower()))
 
-    r = settings.ELASTIC.search(body={
-        "query": {
-            "query_string": {
-                "query": '"%s"*' % value,
+    r = settings.ELASTIC.search(
+        index=settings.ELASTIC_INDEX + "-*",
+        body={
+            "query": {
+                "query_string": {
+                    "query": '"%s"*' % value,
+                },
             },
-        },
-    })
+        }
+    )
 
     analyses = []
     for hit in r["hits"]["hits"]:
@@ -380,7 +423,7 @@ def search(request):
             continue
 
         analyses.append({
-            "task_id": hit["_index"].split("-")[-1],
+            "task_id": hit["_source"]["report_id"],
             "matches": matches[:16],
             "total": max(len(matches)-16, 0),
         })
@@ -512,3 +555,220 @@ def pcapstream(request, task_id, conntuple):
     packets = list(network.packets_for_stream(fobj, offset))
     # TODO: starting from django 1.7 we should use JsonResponse.
     return HttpResponse(json.dumps(packets), content_type="application/json")
+
+def export_analysis(request, task_id):
+    if request.method == "POST":
+        return export(request, task_id)
+
+    report = results_db.analysis.find_one(
+        {"info.id": int(task_id)}, sort=[("_id", pymongo.DESCENDING)]
+    )
+    if not report:
+        return render(request, "error.html", {
+            "error": "The specified analysis does not exist",
+        })
+
+    if "analysis_path" not in report.get("info", {}):
+        return render(request, "error.html", {
+            "error": "The analysis was created before the export "
+                     "functionality was integrated with Cuckoo and is "
+                     "therefore not available for this task (in order to "
+                     "export this analysis, please reprocess its report)."
+        })
+
+    analysis_path = report["info"]["analysis_path"]
+
+    # Locate all directories/results available for this analysis.
+    dirs, files = [], []
+    for filename in os.listdir(analysis_path):
+        path = os.path.join(analysis_path, filename)
+        if os.path.isdir(path):
+            dirs.append((filename, len(os.listdir(path))))
+        else:
+            files.append(filename)
+
+    return render(request, "analysis/export.html", {
+        "analysis": report,
+        "dirs": dirs,
+        "files": files,
+    })
+
+def json_default(obj):
+    if isinstance(obj, datetime.datetime):
+        if obj.utcoffset() is not None:
+            obj = obj - obj.utcoffset()
+        return calendar.timegm(obj.timetuple()) + obj.microsecond / 1000000.0
+    raise TypeError("%r is not JSON serializable" % obj)
+
+def export(request, task_id):
+    taken_dirs = request.POST.getlist("dirs")
+    taken_files = request.POST.getlist("files")
+    if not taken_dirs and not taken_files:
+        return render(request, "error.html", {
+            "error": "Please select at least one directory or file to be exported."
+        })
+
+    report = results_db.analysis.find_one(
+        {"info.id": int(task_id)}, sort=[("_id", pymongo.DESCENDING)]
+    )
+    if not report:
+        return render(request, "error.html", {
+            "error": "The specified analysis does not exist",
+        })
+
+    path = report["info"]["analysis_path"]
+
+    # Creating an analysis.json file with basic information about this
+    # analysis. This information serves as metadata when importing a task.
+    analysis_path = os.path.join(path, "analysis.json")
+    with open(analysis_path, "w") as outfile:
+        report["target"].pop("file_id", None)
+        metadata = {
+            "info": report["info"],
+            "target": report["target"],
+        }
+        json.dump(metadata, outfile, indent=4, default=json_default)
+
+    f = StringIO()
+
+    # Creates a zip file with the selected files and directories of the task.
+    zf = zipfile.ZipFile(f, "w", zipfile.ZIP_DEFLATED)
+
+    for dirname, subdirs, files in os.walk(path):
+        if os.path.basename(dirname) == task_id:
+            for filename in files:
+                if filename in taken_files:
+                    zf.write(os.path.join(dirname, filename), filename)
+        if os.path.basename(dirname) in taken_dirs:
+            for filename in files:
+                zf.write(os.path.join(dirname, filename),
+                         os.path.join(os.path.basename(dirname), filename))
+
+    zf.close()
+
+    response = HttpResponse(f.getvalue(), content_type="application/zip")
+    response["Content-Disposition"] = "attachment; filename=%s.zip" % task_id
+    return response
+
+def import_analysis(request):
+    if request.method == "GET":
+        return render(request, "analysis/import.html")
+
+    db = Database()
+    task_ids = []
+
+    for analysis in request.FILES.getlist("analyses"):
+        if not analysis.size:
+            return render(request, "error.html", {
+                "error": "You uploaded an empty analysis.",
+            })
+
+        # if analysis.size > settings.MAX_UPLOAD_SIZE:
+            # return render(request, "error.html", {
+            #     "error": "You uploaded a file that exceeds that maximum allowed upload size.",
+            # })
+
+        if not analysis.name.endswith(".zip"):
+            return render(request, "error.html", {
+                "error": "You uploaded an analysis that wasn't a .zip.",
+            })
+
+        zf = zipfile.ZipFile(analysis)
+
+        # As per Python documentation we have to make sure there are no
+        # incorrect filenames.
+        for filename in zf.namelist():
+            if filename.startswith("/") or ".." in filename or ":" in filename:
+                return render(request, "error.html", {
+                    "error": "The zip file contains incorrect filenames, "
+                             "please provide a legitimate .zip file.",
+                })
+
+        if "analysis.json" in zf.namelist():
+            analysis_info = json.loads(zf.read("analysis.json"))
+        elif "binary" in zf.namelist():
+            analysis_info = {
+                "target": {
+                    "category": "file",
+                },
+            }
+        else:
+            analysis_info = {
+                "target": {
+                    "category": "url",
+                    "url": "unknown",
+                },
+            }
+
+        category = analysis_info["target"]["category"]
+        info = analysis_info.get("info", {})
+
+        if category == "file":
+            binary = store_temp_file(zf.read("binary"), "binary")
+
+            if os.path.isfile(binary):
+                task_id = db.add_path(file_path=binary,
+                                      package=info.get("package"),
+                                      timeout=0,
+                                      options=info.get("options"),
+                                      priority=0,
+                                      machine="",
+                                      custom=info.get("custom"),
+                                      memory=False,
+                                      enforce_timeout=False,
+                                      tags=info.get("tags"))
+                if task_id:
+                    task_ids.append(task_id)
+
+        elif category == "url":
+            url = analysis_info["target"]["url"]
+            if not url:
+                return render(request, "error.html", {
+                    "error": "You specified an invalid URL!",
+                })
+
+            task_id = db.add_url(url=url,
+                                 package=info.get("package"),
+                                 timeout=0,
+                                 options=info.get("options"),
+                                 priority=0,
+                                 machine="",
+                                 custom=info.get("custom"),
+                                 memory=False,
+                                 enforce_timeout=False,
+                                 tags=info.get("tags"))
+            if task_id:
+                task_ids.append(task_id)
+
+        if not task_id:
+            continue
+
+        # Extract all of the files related to this analysis. This probably
+        # requires some hacks depending on the user/group the Web
+        # Interface is running under.
+        analysis_path = os.path.join(
+            CUCKOO_ROOT, "storage", "analyses", "%d" % task_id
+        )
+
+        if not os.path.exists(analysis_path):
+            os.mkdir(analysis_path)
+
+        zf.extractall(analysis_path)
+
+        # We set this analysis as completed so that it will be processed
+        # automatically (assuming process.py / process2.py is running).
+        db.set_status(task_id, TASK_COMPLETED)
+
+    if task_ids:
+        return render(request, "submission/complete.html", {
+            "tasks": task_ids,
+            "baseurl": request.build_absolute_uri("/")[:-1],
+        })
+
+def reboot_analysis(request, task_id):
+    task_id = Database().add_reboot(task_id=task_id)
+
+    return render(request, "submission/reboot.html", {
+        "task_id": task_id,
+        "baseurl": request.build_absolute_uri("/")[:-1],
+    })

@@ -8,6 +8,7 @@ import logging
 import random
 import subprocess
 import tempfile
+
 from ctypes import byref, c_ulong, create_string_buffer, c_int, sizeof
 from ctypes import c_uint, c_wchar_p, create_unicode_buffer
 
@@ -19,6 +20,17 @@ from lib.common.exceptions import CuckooError
 from lib.common.results import upload_to_host
 
 log = logging.getLogger(__name__)
+
+def subprocess_checkcall(args, env=None):
+    return subprocess.check_call(
+        args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=env,
+    )
+
+def subprocess_checkoutput(args, env=None):
+    return subprocess.check_output(
+        args, stdin=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+    )
 
 class Process(object):
     """Windows process."""
@@ -155,8 +167,8 @@ class Process(object):
         """
         ret = []
         for line in args:
-            if " " in line or '"' in line:
-                ret.append("\"%s\"" % line.replace('"', '\\"'))
+            if " " in line:
+                ret.append('"%s"' % line)
             else:
                 ret.append(line)
         return " ".join(ret)
@@ -180,6 +192,7 @@ class Process(object):
             args = [is32bit_exe, "-p", "%s" % pid]
         elif process_name:
             args = [is32bit_exe, "-n", process_name]
+
         # If we're running a 32-bit Python in a 64-bit Windows system and the
         # path points to System32, then we hardcode it as being a 64-bit
         # binary. (To be fair, a 64-bit Python on 64-bit Windows would also
@@ -191,14 +204,15 @@ class Process(object):
             args = [is32bit_exe, "-f", self.shortpath(path)]
 
         try:
-            bitsize = int(subprocess.check_output(args))
+            bitsize = int(subprocess_checkoutput(args))
         except subprocess.CalledProcessError as e:
             raise CuckooError("Error returned by is32bit: %s" % e)
 
         return bitsize == 32
 
     def execute(self, path, args=None, dll=None, free=False, curdir=None,
-                source=None, mode=None, maximize=False):
+                source=None, mode=None, maximize=False, env=None,
+                trigger=None):
         """Execute sample process.
         @param path: sample path.
         @param args: process args.
@@ -209,6 +223,8 @@ class Process(object):
                        become the parent process for the new process.
         @param mode: monitor mode - which functions to instrument.
         @param maximize: whether the GUI should be maximized.
+        @param env: environment variables.
+        @param trigger: trigger to indicate analysis start
         @return: operation status.
         """
         if not os.access(path, os.X_OK):
@@ -231,21 +247,27 @@ class Process(object):
                         "injection aborted.")
             return False
 
-        if is32bit:
+        if source:
+            if isinstance(source, (int, long)) or source.isdigit():
+                inject_is32bit = self.is32bit(pid=int(source))
+            else:
+                inject_is32bit = self.is32bit(process_name=source)
+        else:
+            inject_is32bit = is32bit
+
+        if inject_is32bit:
             inject_exe = os.path.join("bin", "inject-x86.exe")
         else:
             inject_exe = os.path.join("bin", "inject-x64.exe")
 
-        argv = [inject_exe, "--app", self.shortpath(path)]
+        argv = [
+            inject_exe,
+            "--app", self.shortpath(path),
+            "--only-start",
+        ]
 
         if args:
             argv += ["--args", self._encode_args(args)]
-
-        if free:
-            argv += ["--free"]
-        else:
-            argv += ["--apc", "--dll", dllpath,
-                     "--config", self.drop_config(mode=mode)]
 
         if curdir:
             argv += ["--curdir", self.shortpath(curdir)]
@@ -260,7 +282,37 @@ class Process(object):
             argv += ["--maximize"]
 
         try:
-            self.pid = int(subprocess.check_output(argv))
+            output = subprocess_checkoutput(argv, env)
+            self.pid, self.tid = map(int, output.split())
+        except Exception:
+            log.error("Failed to execute process from path %r with "
+                      "arguments %r (Error: %s)", path, argv,
+                      get_error_string(KERNEL32.GetLastError()))
+            return False
+
+        if is32bit:
+            inject_exe = os.path.join("bin", "inject-x86.exe")
+        else:
+            inject_exe = os.path.join("bin", "inject-x64.exe")
+
+        argv = [
+            inject_exe,
+            "--resume-thread",
+            "--pid", "%s" % self.pid,
+            "--tid", "%s" % self.tid,
+        ]
+
+        if free:
+            argv.append("--free")
+        else:
+            argv += [
+                "--apc",
+                "--dll", dllpath,
+                "--config", self.drop_config(mode=mode, trigger=trigger),
+            ]
+
+        try:
+            subprocess_checkoutput(argv, env)
         except Exception:
             log.error("Failed to execute process from path %r with "
                       "arguments %r (Error: %s)", path, argv,
@@ -318,7 +370,6 @@ class Process(object):
                 dll = "monitor-x64.dll"
 
         dllpath = os.path.abspath(os.path.join("bin", dll))
-
         if not os.path.exists(dllpath):
             log.warning("No valid DLL specified to be injected in process "
                         "with pid %s / process name %s, injection aborted.",
@@ -331,7 +382,8 @@ class Process(object):
             inject_exe = os.path.join("bin", "inject-x64.exe")
 
         args = [
-            inject_exe, "--dll", dllpath,
+            inject_exe,
+            "--dll", dllpath,
             "--config", self.drop_config(track=track, mode=mode),
         ]
 
@@ -346,17 +398,16 @@ class Process(object):
             args += ["--crt"]
 
         try:
-            subprocess.check_call(args)
+            subprocess_checkcall(args)
         except Exception:
             log.error("Failed to inject %s-bit process with pid %s and "
                       "process name %s", 32 if is32bit else 64, self.pid,
                       self.process_name)
             return False
 
-        log.info("Successfully injected process with pid %s", self.pid)
         return True
 
-    def drop_config(self, track=True, mode=None):
+    def drop_config(self, track=True, mode=None, trigger=None):
         """Helper function to drop the configuration for a new process."""
         fd, config_path = tempfile.mkstemp()
 
@@ -368,8 +419,6 @@ class Process(object):
             Process.startup_time = random.randint(1, 30) * 20 * 60 * 1000
 
         lines = {
-            "host-ip": self.config.ip,
-            "host-port": self.config.port,
             "pipe": self.config.pipe,
             "logpipe": self.config.logpipe,
             "analyzer": os.getcwd(),
@@ -380,6 +429,8 @@ class Process(object):
             "track": "1" if track else "0",
             "mode": mode or "",
             "disguise": self.config.options.get("disguise", "0"),
+            "pipe-pid": "1",
+            "trigger": trigger or "",
         }
 
         for key, value in lines.items():
@@ -389,8 +440,8 @@ class Process(object):
         Process.first_process = False
         return config_path
 
-    def dump_memory(self):
-        """Dump process memory.
+    def dump_memory(self, addr=None, length=None):
+        """Dump process memory, optionally target only a certain memory range.
         @return: operation status.
         """
         if not self.pid:
@@ -416,7 +467,16 @@ class Process(object):
                 "--pid", "%s" % self.pid,
                 "--dump", dump_path,
             ]
-            subprocess.check_call(args)
+
+            # Restrict to a certain memory block.
+            if addr and length:
+                args += [
+                    "--dump-block",
+                    "0x%x" % addr,
+                    "%s" % length,
+                ]
+
+            subprocess_checkcall(args)
         except subprocess.CalledProcessError:
             log.error("Failed to dump memory of %d-bit process with pid %d.",
                       32 if self.is32bit(pid=self.pid) else 64, self.pid)
@@ -426,9 +486,20 @@ class Process(object):
         # the host. Keep in mind that one process may have multiple process
         # memory dumps in the future.
         idx = self.dumpmem[self.pid] = self.dumpmem.get(self.pid, 0) + 1
-        file_name = os.path.join("memory", "%s-%s.dmp" % (self.pid, idx))
+
+        if addr and length:
+            file_name = os.path.join(
+                "memory", "block-%s-0x%x-%s.dmp" % (self.pid, addr, idx)
+            )
+        else:
+            file_name = os.path.join("memory", "%s-%s.dmp" % (self.pid, idx))
+
         upload_to_host(dump_path, file_name)
         os.unlink(dump_path)
 
         log.info("Memory dump of process with pid %d completed", self.pid)
         return True
+
+    # The dump_memory_block functionality has been integrated with the
+    # dump_memory function, this alias is just for backwards compatibility.
+    dump_memory_block = dump_memory

@@ -10,7 +10,7 @@ import logging
 import threading
 import Queue
 
-from lib.cuckoo.common.config import Config, parse_options, emit_options
+from lib.cuckoo.common.config import Config, emit_options
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooMachineError, CuckooGuestError
 from lib.cuckoo.common.exceptions import CuckooOperationalError
@@ -19,6 +19,7 @@ from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.utils import create_folder
 from lib.cuckoo.core.database import Database, TASK_COMPLETED, TASK_REPORTED
 from lib.cuckoo.core.guest import GuestManager
+from lib.cuckoo.core.log import task_log_start, task_log_stop
 from lib.cuckoo.core.plugins import list_plugins, RunAuxiliary, RunProcessing
 from lib.cuckoo.core.plugins import RunSignatures, RunReporting
 from lib.cuckoo.core.resultserver import ResultServer
@@ -41,19 +42,23 @@ class AnalysisManager(threading.Thread):
     complete the analysis and store, process and report its results.
     """
 
-    def __init__(self, task, error_queue):
+    def __init__(self, task_id, error_queue):
         """@param task: task object containing the details for the analysis."""
         threading.Thread.__init__(self)
 
-        self.task = task
         self.errors = error_queue
         self.cfg = Config()
         self.storage = ""
         self.binary = ""
+        self.storage_binary = ""
         self.machine = None
-        self.db = Database()
 
-        self.task.options = parse_options(self.task.options)
+        self.db = Database()
+        self.task = self.db.view_task(task_id)
+        self.guest_manager = None
+
+        self.interface = None
+        self.rt_table = None
 
     def init_storage(self):
         """Initialize analysis storage folder."""
@@ -113,17 +118,25 @@ class AnalysisManager(threading.Thread):
                 return False
 
         try:
-            new_binary_path = os.path.join(self.storage, "binary")
+            self.storage_binary = os.path.join(self.storage, "binary")
 
             if hasattr(os, "symlink"):
-                os.symlink(self.binary, new_binary_path)
+                os.symlink(self.binary, self.storage_binary)
             else:
-                shutil.copy(self.binary, new_binary_path)
+                shutil.copy(self.binary, self.storage_binary)
         except (AttributeError, OSError) as e:
             log.error("Unable to create symlink/copy from \"%s\" to "
                       "\"%s\": %s", self.binary, self.storage, e)
 
         return True
+
+    def store_task_info(self):
+        """grab latest task from db (if available) and update self.task"""
+        dbtask = self.db.view_task(self.task.id)
+        self.task = dbtask.to_dict()
+
+        task_info_path = os.path.join(self.storage, "task.json")
+        open(task_info_path, "w").write(dbtask.to_json())
 
     def acquire_machine(self):
         """Acquire an analysis machine from the pool of available ones."""
@@ -270,21 +283,17 @@ class AnalysisManager(threading.Thread):
         if self.task.category == "baseline":
             time.sleep(options["timeout"])
         else:
-            # Initialize the guest manager.
-            guest = GuestManager(self.machine.name, self.machine.ip,
-                                 self.machine.platform, self.task.id)
-
             # Start the analysis.
             self.db.guest_set_status(self.task.id, "starting")
             monitor = self.task.options.get("monitor", "latest")
-            guest.start_analysis(options, monitor)
+            self.guest_manager.start_analysis(options, monitor)
 
             # In case the Agent didn't respond and we force-quit the analysis
             # at some point while it was still starting the analysis the state
             # will be "stop" (or anything but "running", really).
             if self.db.guest_get_status(self.task.id) == "starting":
                 self.db.guest_set_status(self.task.id, "running")
-                guest.wait_for_completion()
+                self.guest_manager.wait_for_completion()
 
             self.db.guest_set_status(self.task.id, "stopping")
 
@@ -303,6 +312,11 @@ class AnalysisManager(threading.Thread):
         # Initialize the analysis folders.
         if not self.init_storage():
             return False
+
+        # Initiates per-task logging.
+        task_log_start(self.task.id)
+
+        self.store_task_info()
 
         if self.task.category == "file":
             # Check whether the file has been changed for some unknown reason.
@@ -329,8 +343,14 @@ class AnalysisManager(threading.Thread):
             machinery.release(self.machine.label)
             self.errors.put(e)
 
-        aux = RunAuxiliary(task=self.task, machine=self.machine)
-        aux.start()
+        # Initialize the guest manager.
+        self.guest_manager = GuestManager(
+            self.machine.name, self.machine.ip,
+            self.machine.platform, self.task.id, self
+        )
+
+        self.aux = RunAuxiliary(self.task, self.machine, self.guest_manager)
+        self.aux.start()
 
         # Generate the analysis configuration file.
         options = self.build_options()
@@ -384,7 +404,7 @@ class AnalysisManager(threading.Thread):
             log.error(str(e), extra={"task_id": self.task.id})
         finally:
             # Stop Auxiliary modules.
-            aux.stop()
+            self.aux.stop()
 
             # Take a memory dump of the machine before shutting it off.
             if self.cfg.cuckoo.memory_dump or self.task.memory:
@@ -429,9 +449,9 @@ class AnalysisManager(threading.Thread):
 
     def process_results(self):
         """Process the analysis results and generate the enabled reports."""
-        results = RunProcessing(task=self.task.to_dict()).run()
+        results = RunProcessing(task=self.task).run()
         RunSignatures(results=results).run()
-        RunReporting(task=self.task.to_dict(), results=results).run()
+        RunReporting(task=self.task, results=results).run()
 
         # If the target is a file and the user enabled the option,
         # delete the original copy.
@@ -456,6 +476,12 @@ class AnalysisManager(threading.Thread):
                     os.remove(self.binary)
                 except OSError as e:
                     log.error("Unable to delete the copy of the original file at path \"%s\": %s", self.binary, e)
+            # Check if the binary in the analysis directory is an invalid symlink. If it is, delete it.
+            if os.path.islink(self.storage_binary) and not os.path.exists(self.storage_binary):
+                try:
+                    os.remove(self.storage_binary)
+                except OSError as e:
+                    log.error("Unable to delete symlink to the binary copy at path \"%s\": %s", self.storage_binary, e)
 
         log.info("Task #%d: reports generation completed (path=%s)",
                  self.task.id, self.storage)
@@ -471,15 +497,12 @@ class AnalysisManager(threading.Thread):
 
             self.db.set_status(self.task.id, TASK_COMPLETED)
 
-            # If the task is still available in the database, update our task
-            # variable with what's in the database, as otherwise we're missing
-            # out on the status and completed_on change. This would then in
-            # turn thrown an exception in the analysisinfo processing module.
-            self.task = self.db.view_task(self.task.id) or self.task
-
             log.debug("Released database task #%d", self.task.id)
 
             if self.cfg.cuckoo.process_results:
+                # this updates self.task so processing gets the latest and greatest
+                self.store_task_info()
+
                 self.process_results()
                 self.db.set_status(self.task.id, TASK_REPORTED)
 
@@ -506,10 +529,13 @@ class AnalysisManager(threading.Thread):
                 finally:
                     latest_symlink_lock.release()
 
+            # overwrite task.json so we have the latest data inside
+            self.store_task_info()
             log.info("Task #%d: analysis procedure completed", self.task.id)
         except:
             log.exception("Failure in AnalysisManager.run")
 
+        task_log_stop(self.task.id)
         active_analysis_count -= 1
 
 class Scheduler(object):
@@ -603,7 +629,7 @@ class Scheduler(object):
             # Drop forwarding rule to each VPN.
             for vpn in vpns.values():
                 rooter("forward_disable", machine.interface,
-                       vpn["interface"], machine.ip)
+                       vpn.interface, machine.ip)
 
             # Drop forwarding rule to the internet / dirty line.
             if self.cfg.routing.internet != "none":
@@ -709,7 +735,7 @@ class Scheduler(object):
                 self.total_analysis_count += 1
 
                 # Initialize and start the analysis manager.
-                analysis = AnalysisManager(task, errors)
+                analysis = AnalysisManager(task.id, errors)
                 analysis.daemon = True
                 analysis.start()
 
