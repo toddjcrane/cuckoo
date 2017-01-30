@@ -231,7 +231,7 @@ class vSphere(Machinery):
                     yield node
 
         self.VMtoDC = {}
-        
+
         for dc, dcpath in traverseDCFolders(conn, conn.content.rootFolder.childEntity):
             for vm in traverseVMFolders(conn, dc.vmFolder.childEntity):
                 self.VMtoDC[vm.summary.config.name] = dcpath
@@ -315,7 +315,7 @@ class vSphere(Machinery):
     def _download_snapshot(self, conn, vm, name, path):
         """Download snapshot file from host to local path"""
 
-        # Get filespec to .vmsn file of named snapshot
+        # Get filespec to .vmsn or .vmem file of named snapshot
         snapshot = self._get_snapshot_by_name(vm, name)
         if not snapshot:
             raise CuckooMachineError(
@@ -323,16 +323,27 @@ class vSphere(Machinery):
                 (name, vm.summary.config.name)
             )
 
-        datakey = filespec = None
+        memorykey = datakey = filespec = None
         for s in vm.layoutEx.snapshot:
             if s.key == snapshot:
+                memorykey = s.memoryKey
                 datakey = s.dataKey
                 break
 
         for f in vm.layoutEx.file:
-            if f.key == datakey:
+            if f.key == memorykey and (f.type == "snapshotMemory" or
+                                       f.type == "suspendMemory"):
                 filespec = f.name
                 break
+
+        if not filespec:
+            for f in vm.layoutEx.file:
+                if f.key == datakey and f.type == "snapshotData":
+                    filespec = f.name
+                    break
+
+        if not filespec:
+            raise CuckooMachineError("Could not find snapshot memory file")
 
         log.info("Downloading memory dump %s to %s", filespec, path)
 
@@ -356,9 +367,12 @@ class vSphere(Machinery):
             response = requests.get(url, params=params, headers=headers,
                                     verify=False, stream=True)
 
+            response.raise_for_status()
+
             with open(path, "wb") as localfile:
                 for chunk in response.iter_content(16*1024):
                     localfile.write(chunk)
+
         except Exception as e:
             raise CuckooMachineError(
                 "Error downloading memory dump %s: %s" %

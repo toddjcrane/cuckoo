@@ -16,6 +16,7 @@ class XLS(Package):
         ("ProgramFiles", "Microsoft Office", "Office12", "EXCEL.EXE"),
         ("ProgramFiles", "Microsoft Office", "Office14", "EXCEL.EXE"),
         ("ProgramFiles", "Microsoft Office", "Office15", "EXCEL.EXE"),
+        ("ProgramFiles", "Microsoft Office", "Office16", "EXCEL.EXE"),
         ("ProgramFiles", "Microsoft Office 15", "root", "office15", "EXCEL.EXE"),
     ]
 
@@ -47,4 +48,6 @@ class XLS(Package):
 
     def start(self, path):
         excel = self.get_path("Microsoft Office Excel")
-        return self.execute(excel, args=[path], trigger="file:%s" % path)
+        return self.execute(
+            excel, args=[path], mode="office", trigger="file:%s" % path
+        )

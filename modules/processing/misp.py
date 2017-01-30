@@ -5,16 +5,20 @@
 import datetime
 import logging
 import os.path
+import warnings
+
+try:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        import pymisp
+
+    HAVE_MISP = True
+except ImportError:
+    HAVE_MISP = False
 
 from lib.cuckoo.common.abstracts import Processing
 from lib.cuckoo.common.exceptions import CuckooDependencyError
 from lib.cuckoo.common.exceptions import CuckooProcessingError
-
-try:
-    from pymisp import PyMISP
-    HAVE_MISP = True
-except ImportError:
-    HAVE_MISP = False
 
 log = logging.getLogger(__name__)
 
@@ -75,14 +79,10 @@ class MISP(Processing):
                 "Please configure the URL and API key for your MISP instance."
             )
 
-        # Ensure the URL ends with a trailing slash.
-        if not self.url.endswith("/"):
-            self.url += "/"
-
         self.key = "misp"
         self.iocs = {}
 
-        self.misp = PyMISP(self.url, self.apikey, False, "json")
+        self.misp = pymisp.PyMISP(self.url, self.apikey, False, "json")
         iocs = set()
 
         iocs.add(self.results.get("target", {}).get("file", {}).get("md5"))

@@ -14,7 +14,7 @@ preferred.
 
 Install the basic dependencies::
 
-    $ sudo apt-get install python python-pip python-dev libffi-dev libssl-dev
+    $ sudo apt-get install python python-pip python-dev libffi-dev libssl-dev libxml2-dev libxslt1-dev libjpeg-dev
 
 If you want to use the Django-based web interface, you'll have to install
 MongoDB too::
@@ -42,7 +42,7 @@ If you want to use the *mitm* auxiliary module (to intercept SSL/TLS generated
 traffic), you need to install `mitmproxy`_. Please refer to its website for
 installation instructions.
 
-.. _Yara: http://code.google.com/p/yara-project/
+.. _Yara: http://virustotal.github.io/yara/
 .. _Pydeep: https://github.com/kbandla/pydeep
 .. _mitmproxy: https://mitmproxy.org/
 

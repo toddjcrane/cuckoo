@@ -16,6 +16,7 @@ class PPT(Package):
         ("ProgramFiles", "Microsoft Office", "Office12", "POWERPNT.EXE"),
         ("ProgramFiles", "Microsoft Office", "Office14", "POWERPNT.EXE"),
         ("ProgramFiles", "Microsoft Office", "Office15", "POWERPNT.EXE"),
+        ("ProgramFiles", "Microsoft Office", "Office16", "POWERPNT.EXE"),
         ("ProgramFiles", "Microsoft Office 15", "root", "office15", "POWERPNT.EXE"),
     ]
 
@@ -48,5 +49,6 @@ class PPT(Package):
     def start(self, path):
         powerpoint = self.get_path("Microsoft Office PowerPoint")
         return self.execute(
-            powerpoint, args=["/S", path], trigger="file:%s" % path
+            powerpoint, args=["/S", path], mode="office",
+            trigger="file:%s" % path
         )
