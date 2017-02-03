@@ -49,6 +49,7 @@ def custom_headers(response):
     response.headers["Pragma"] = "no-cache"
     response.headers["Cache-Control"] = "no-cache"
     response.headers["Expires"] = "0"
+    response.headers["Content-Type"] = "text/plain"
     return response
 
 @app.route("/tasks/create/file", methods=["POST"])
@@ -535,6 +536,19 @@ def memorydumps_get(task_id, pid=None):
             return json_error(404, "Memory dump not found")
     else:
         return json_error(404, "Memory dump not found")
+
+@app.route("/ioc/get/<int:task_id>")
+def ioc_get(task_id):
+    file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
+                             "%d" % task_id, "reports", "ioc.json")
+    if os.path.exists(file_path):
+        try:
+            data = open(file_path)
+            return data.read()
+        except:
+            return json_error(500, "An error occurred while reading IOCs")
+    else:
+        return json_error(404, "File not found")
 
 @app.route("/vpn/status")
 def vpn_status():

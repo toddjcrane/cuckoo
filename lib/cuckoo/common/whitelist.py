@@ -8,10 +8,28 @@ import os.path
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 
 domains = set()
+urls = set()
+tlds = set()
 
 def is_whitelisted_domain(domain):
     return domain in domains
 
+def is_whitelisted_url(url):
+    if url in urls:
+        return True
+    return False
+
+def is_whitelisted_tld(tld):
+    if tld in tlds:
+        return True
+    return False
+
 # Initialize the domain whitelist.
 for domain in open(os.path.join(CUCKOO_ROOT, "data", "whitelist", "domain.txt")):
     domains.add(domain.strip())
+
+for url in open(os.path.join(CUCKOO_ROOT, "data", "whitelist", "urls.txt")):
+    urls.add(url.strip())
+
+for tld in open(os.path.join(CUCKOO_ROOT, "data", "whitelist", "tld.txt")):
+    tlds.add(tld.strip())
