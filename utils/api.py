@@ -18,7 +18,7 @@ try:
 except ImportError:
     sys.exit("ERROR: Flask library is missing (`pip install flask`)")
 
-sys.path.append(os.path.join(os.path.abspath(os.path.dirname(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), ".."))
 
 from lib.cuckoo.common.constants import CUCKOO_VERSION, CUCKOO_ROOT
 from lib.cuckoo.common.utils import store_temp_file, delete_folder
@@ -291,6 +291,8 @@ def tasks_report(task_id, report_format="json"):
         tar = tarfile.open(fileobj=s, mode=tarmode, dereference=True)
         for filedir in os.listdir(srcdir):
             filepath = os.path.join(srcdir, filedir)
+            if not os.path.exists(filepath):
+                continue
             if bzf["type"] == "-" and filedir not in bzf["files"]:
                 tar.add(filepath, arcname=filedir)
             if bzf["type"] == "+" and filedir in bzf["files"]:
@@ -305,7 +307,12 @@ def tasks_report(task_id, report_format="json"):
         return json_error(400, "Invalid report format")
 
     if os.path.exists(report_path):
-        return open(report_path, "rb").read()
+        if report_format == "json":
+            response = make_response(open(report_path, "rb").read())
+            response.headers["Content-Type"] = "application/json"
+            return response
+        else:
+            return open(report_path, "rb").read()
     else:
         return json_error(404, "Report not found")
 
@@ -350,6 +357,14 @@ def rereport(task_id):
         return jsonify(success=False)
     else:
         return json_error(404, "Task not found")
+
+@app.route("/tasks/reboot/<int:task_id>")
+def reboot(task_id):
+    reboot_id = Database().add_reboot(task_id=task_id)
+    if not reboot_id:
+        return json_error(404, "Error creating reboot task")
+
+    return jsonify(task_id=task_id, reboot_id=reboot_id)
 
 @app.route("/files/view/md5/<md5>")
 @app.route("/v1/files/view/md5/<md5>")
@@ -513,7 +528,7 @@ def memorydumps_list(task_id):
         if len(memory_files) == 0:
             return json_error(404, "Memory dump not found")
 
-        return jsonify(memory_files)
+        return jsonify({"dump_files": memory_files})
     else:
         return json_error(404, "Memory dump not found")
 

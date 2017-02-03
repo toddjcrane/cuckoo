@@ -4,6 +4,7 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import collections
+import json
 import logging
 import os
 
@@ -83,8 +84,10 @@ class ProcessTree(BehaviorHandler):
 
     def handle_event(self, process):
         if process["pid"] in self.processes:
-            log.warning("Found the same process identifier twice, this "
-                        "shouldn't happen!")
+            log.warning(
+                "Found the same process identifier twice, this "
+                "shouldn't happen!"
+            )
             return
 
         self.processes[process["pid"]] = {
@@ -94,16 +97,19 @@ class ProcessTree(BehaviorHandler):
             "command_line": process.get("command_line"),
             "first_seen": process["first_seen"],
             "children": [],
-            "track": process["track"],
+            "track": process.get("track", True),
         }
 
     def run(self):
-        root = {"children": []}
+        root = {
+            "children": [],
+        }
+        first_seen = lambda x: x["first_seen"]
 
-        for p in self.processes.values():
+        for p in sorted(self.processes.values(), key=first_seen):
             self.processes.get(p["ppid"], root)["children"].append(p)
 
-        return root["children"]
+        return sorted(root["children"], key=first_seen)
 
 class GenericBehavior(BehaviorHandler):
     """Generates summary information."""
@@ -123,6 +129,7 @@ class GenericBehavior(BehaviorHandler):
             "pid": process["pid"],
             "ppid": process["ppid"],
             "process_name": process["process_name"],
+            "process_path": process.get("process_path", None),
             "first_seen": process["first_seen"],
             "summary": collections.defaultdict(set),
         }
@@ -157,73 +164,53 @@ class ApiStats(BehaviorHandler):
     def run(self):
         return self.processes
 
-class PlatformInfo(BehaviorHandler):
-    """Provides information about the platform for the collected behavior.
+class RebootInformation(BehaviorHandler):
+    """Provides specific information useful for reboot analysis.
 
-    Not sure if this is really needed, as probably all the info is in the results["info"] area.
+    In reality this is not a true BehaviorHandler as it doesn't return any
+    data into the JSON report, but instead it writes a log file which will be
+    interpreted when doing a reboot analysis.
     """
-    key = "platform"
 
-    # self.results = {
-    #     "name": "windows",
-    #     "architecture": "unknown", # look this up in the task / vm info?
-    #     "source": ["monitor", "windows"],
-    # }
+    event_types = ["reboot"]
+
+    def __init__(self, *args, **kwargs):
+        super(RebootInformation, self).__init__(*args, **kwargs)
+        self.events = []
+
+    def handle_event(self, event):
+        self.events.append((event["time"], event))
+
+    def run(self):
+        reboot_path = os.path.join(self.analysis.analysis_path, "reboot.json")
+        with open(reboot_path, "wb") as f:
+            for ts, event in sorted(self.events):
+                f.write("%s\n" % json.dumps(event))
 
 class BehaviorAnalysis(Processing):
     """Behavior Analyzer.
 
-    The behavior key in the results dict will contain both default content keys
-    that contain generic / abstracted analysis info, available on any platform,
-    as well as platform / analyzer specific output.
+    The behavior key in the results dict will contain both default content
+    keys that contain generic / abstracted analysis info, available on any
+    platform, as well as platform / analyzer specific output.
 
-    Typically the analyzer behavior contains some sort of "process" separation as
-    we're tracking different processes in most cases.
+    Typically the analyzer behavior contains some sort of "process" separation
+    as we're tracking different processes in most cases.
 
-    So this looks roughly like this:
-    "behavior": {
-        "generic": {
-            "processes": [
-                {
-                    "pid": x,
-                    "ppid": y,
-                    "calls": [
-                        {
-                            "function": "foo",
-                            "arguments": {
-                                "a": 1,
-                                "b": 2,
-                            },
-                        },
-                        ...
-                    ]
-                },
-                ...
-            ]
-        }
-        "summary": {
-            "
-        }
-        "platform": {
-            "name": "windows",
-            "architecture": "x86",
-            "source": ["monitor", "windows"],
-            ...
-        }
-    }
+    There are several handlers that produce the respective keys / subkeys.
+    Overall the platform / analyzer specific ones parse / process the captured
+    data and yield both their own output, but also a standard structure that
+    is then captured by the "generic" handlers so they can generate the
+    standard result structures.
 
-    There are several handlers that produce the respective keys / subkeys. Overall
-    the platform / analyzer specific ones parse / process the captured data and yield
-    both their own output, but also a standard structure that is then captured by the
-    "generic" handlers so they can generate the standard result structures.
+    The resulting structure contains some iterator onions for the monitored
+    function calls that stream the content when some sink (reporting,
+    signatures) needs it, thereby reducing memory footprint.
 
-    The resulting structure contains some iterator onions for the monitored function calls
-    that stream the content when some sink (reporting, signatures) needs it, thereby
-    reducing memory footprint.
-
-    So hopefully in the end each analysis should be fine with 2 passes over the results,
-    once during processing (creating the generic output, summaries, etc) and once
-    during reporting (well once for each report type if multiple are enabled).
+    So hopefully in the end each analysis should be fine with 2 passes over
+    the results, once during processing (creating the generic output,
+    summaries, etc) and once during reporting (well once for each report type
+    if multiple are enabled).
     """
 
     key = "behavior"
@@ -272,6 +259,9 @@ class BehaviorAnalysis(Processing):
             # platform specific stuff
             WindowsMonitor(self),
             LinuxSystemTap(self),
+
+            # Reboot information.
+            RebootInformation(self),
         ]
 
         # doesn't really work if there's no task, let's rely on the file name for now

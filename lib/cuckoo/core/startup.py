@@ -3,18 +3,20 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import httplib
 import os
 import shutil
 import sys
-import copy
 import json
+import socket
 import urllib
 import urllib2
 import logging
 import logging.handlers
-import socket
 
-from lib.cuckoo.common.colors import red, green, yellow, cyan
+from distutils.version import LooseVersion
+
+from lib.cuckoo.common.colors import red, green, yellow
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT, CUCKOO_VERSION
 from lib.cuckoo.common.exceptions import CuckooStartupError, CuckooDatabaseError
@@ -22,6 +24,8 @@ from lib.cuckoo.common.exceptions import CuckooOperationalError
 from lib.cuckoo.common.utils import create_folders
 from lib.cuckoo.core.database import Database, TASK_RUNNING
 from lib.cuckoo.core.database import TASK_FAILED_ANALYSIS, TASK_PENDING
+from lib.cuckoo.core.log import DatabaseHandler, ConsoleHandler, TaskHandler
+from lib.cuckoo.core.log import JsonFormatter
 from lib.cuckoo.core.plugins import import_plugin, import_package, list_plugins
 from lib.cuckoo.core.rooter import rooter, vpns
 
@@ -60,10 +64,12 @@ def check_configs():
     """Checks if config files exist.
     @raise CuckooStartupError: if config files do not exist.
     """
-    configs = ("auxiliary.conf", "avd.conf", "cuckoo.conf", "esx.conf",
-               "kvm.conf", "memory.conf", "physical.conf", "processing.conf",
-               "qemu.conf", "reporting.conf", "virtualbox.conf", "vmware.conf",
-               "vpn.conf", "vsphere.conf", "xenserver.conf")
+    configs = (
+        "auxiliary.conf", "avd.conf", "cuckoo.conf", "esx.conf", "kvm.conf",
+        "memory.conf", "physical.conf", "processing.conf", "qemu.conf",
+        "reporting.conf", "virtualbox.conf", "vmware.conf", "vpn.conf",
+        "vsphere.conf", "xenserver.conf",
+    )
 
     for config in [os.path.join(CUCKOO_ROOT, "conf", f) for f in configs]:
         if not os.path.exists(config):
@@ -102,54 +108,30 @@ def check_version():
     try:
         request = urllib2.Request(url, data)
         response = urllib2.urlopen(request)
-    except (urllib2.URLError, urllib2.HTTPError):
+    except (urllib2.URLError, urllib2.HTTPError, httplib.BadStatusLine):
         print(red(" Failed! ") + "Unable to establish connection.\n")
         return
 
     try:
-        r = json.loads(response.read())
+        response_data = json.loads(response.read())
     except ValueError:
         print(red(" Failed! ") + "Invalid response.\n")
         return
 
-    if not r["error"]:
-        if r["response"] == "NEW_VERSION" and r["current"] != "1.2":
-            msg = "Cuckoo Sandbox version %s is available now." % r["current"]
+    stable_version = response_data["current"]
+
+    if CUCKOO_VERSION.endswith("-dev"):
+        print(yellow(" You are running a development version! Current stable is {}.".format(
+            stable_version)))
+    else:
+        if LooseVersion(CUCKOO_VERSION) < LooseVersion(stable_version):
+            msg = "Cuckoo Sandbox version {} is available now.".format(
+                stable_version)
+
             print(red(" Outdated! ") + msg)
-        elif r["current"] == "1.2":
-            print(yellow(" Okay! ") + "You are running a development version.")
         else:
             print(green(" Good! ") + "You have the latest version "
                                      "available.\n")
-
-
-class DatabaseHandler(logging.Handler):
-    """Logging to database handler.
-    Used to log errors related to tasks in database.
-    """
-
-    def emit(self, record):
-        if hasattr(record, "task_id"):
-            db = Database()
-            db.add_error(record.msg, int(record.task_id))
-
-class ConsoleHandler(logging.StreamHandler):
-    """Logging to console handler."""
-
-    def emit(self, record):
-        colored = copy.copy(record)
-
-        if record.levelname == "WARNING":
-            colored.msg = yellow(record.msg)
-        elif record.levelname == "ERROR" or record.levelname == "CRITICAL":
-            colored.msg = red(record.msg)
-        else:
-            if "analysis procedure completed" in record.msg:
-                colored.msg = cyan(record.msg)
-            else:
-                colored.msg = record.msg
-
-        logging.StreamHandler.emit(self, colored)
 
 def init_logging():
     """Initializes logging."""
@@ -159,6 +141,10 @@ def init_logging():
     fh.setFormatter(formatter)
     log.addHandler(fh)
 
+    fh = logging.handlers.WatchedFileHandler(os.path.join(CUCKOO_ROOT, "log", "cuckoo.json"))
+    fh.setFormatter(JsonFormatter())
+    log.addHandler(fh)
+
     ch = ConsoleHandler()
     ch.setFormatter(formatter)
     log.addHandler(ch)
@@ -166,6 +152,10 @@ def init_logging():
     dh = DatabaseHandler()
     dh.setLevel(logging.ERROR)
     log.addHandler(dh)
+
+    th = TaskHandler()
+    th.setFormatter(formatter)
+    log.addHandler(th)
 
     log.setLevel(logging.INFO)
 
@@ -187,9 +177,11 @@ def init_tasks():
     log.debug("Checking for locked tasks..")
     for task in db.list_tasks(status=TASK_RUNNING):
         if cfg.cuckoo.reschedule:
-            db.reschedule(task.id)
-            log.info("Rescheduled task with ID {0} and "
-                     "target {1}".format(task.id, task.target))
+            task_id = db.reschedule(task.id)
+            log.info(
+                "Rescheduled task with ID %s and target %s: task #%s",
+                task.id, task.target, task_id
+            )
         else:
             db.set_status(task.id, TASK_FAILED_ANALYSIS)
             log.info("Updated running task ID {0} status to failed_analysis".format(task.id))
@@ -251,15 +243,6 @@ def init_modules(machinery=True):
 
 def init_yara():
     """Generates index for yara signatures."""
-
-    def find_signatures(root):
-        signatures = []
-        for entry in os.listdir(root):
-            if entry.endswith(".yara") or entry.endswith(".yar"):
-                signatures.append(os.path.join(root, entry))
-
-        return signatures
-
     log.debug("Initializing Yara...")
 
     # Generate root directory for yara rules.
@@ -304,11 +287,32 @@ def init_yara():
 def init_binaries():
     """Inform the user about the need to periodically look for new analyzer
     binaries. These include the Windows monitor etc."""
-    monitor = os.path.join(CUCKOO_ROOT, "data", "monitor", "latest")
+    dirpath = os.path.join(CUCKOO_ROOT, "data", "monitor", "latest")
 
     # Checks whether the "latest" symlink is available as well as whether
     # it points to an existing directory.
-    if not os.path.exists(monitor):
+    if not os.path.exists(dirpath):
+        raise CuckooStartupError(
+            "The binaries used for Windows analysis are updated regularly, "
+            "independently from the release line. It appears that you're "
+            "not up-to-date. This can happen when you've just installed "
+            "Cuckoo or when you've updated your Cuckoo version by pulling "
+            "the latest changes from our Git repository. In order to get "
+            "up-to-date, please run the following "
+            "command: `./utils/community.py -wafb monitor` or "
+            "`./utils/community.py -waf` if you'd also like to download "
+            "over 300 Cuckoo signatures."
+        )
+
+    # If "latest" is a file and not a symbolic link, check if it's destination
+    # directory is available.
+    if os.path.isfile(dirpath):
+        monitor = os.path.basename(open(dirpath, "rb").read().strip())
+        dirpath = os.path.join(CUCKOO_ROOT, "data", "monitor", monitor)
+    else:
+        dirpath = None
+
+    if dirpath and not os.path.isdir(dirpath):
         raise CuckooStartupError(
             "The binaries used for Windows analysis are updated regularly, "
             "independently from the release line. It appears that you're "

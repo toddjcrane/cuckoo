@@ -20,7 +20,6 @@ from lib.cuckoo.common.exceptions import CuckooDependencyError
 from lib.cuckoo.common.objects import Dictionary
 from lib.cuckoo.common.utils import create_folder
 from lib.cuckoo.core.database import Database
-from lib.cuckoo.core.resultserver import ResultServer
 
 try:
     import libvirt
@@ -36,6 +35,7 @@ class Auxiliary(object):
     def __init__(self):
         self.task = None
         self.machine = None
+        self.guest_manager = None
         self.options = None
 
     def set_task(self, task):
@@ -43,6 +43,9 @@ class Auxiliary(object):
 
     def set_machine(self, machine):
         self.machine = machine
+
+    def set_guest_manager(self, guest_manager):
+        self.guest_manager = guest_manager
 
     def set_options(self, options):
         self.options = options
@@ -93,6 +96,12 @@ class Machinery(object):
         # Run initialization checks.
         self._initialize_check()
 
+    def _get_resultserver_port(self):
+        """Returns the ResultServer port."""
+        # Avoid import recursion issues by importing ResultServer here.
+        from lib.cuckoo.core.resultserver import ResultServer
+        return ResultServer().port
+
     def _initialize(self, module_name):
         """Read configuration.
         @param module_name: module name.
@@ -127,8 +136,8 @@ class Machinery(object):
                 opt_resultserver = self.options_globals.resultserver
 
                 # the resultserver port might have been dynamically changed
-                #  -> get the current one from the resultserver singelton
-                opt_resultserver.port = ResultServer().port
+                #  -> get the current one from the resultserver singleton
+                opt_resultserver.port = self._get_resultserver_port()
 
                 ip = machine_opts.get("resultserver_ip", opt_resultserver.ip)
                 port = machine_opts.get("resultserver_port", opt_resultserver.port)
@@ -642,9 +651,11 @@ class Processing(object):
         """
         self.analysis_path = analysis_path
         self.log_path = os.path.join(self.analysis_path, "analysis.log")
+        self.cuckoolog_path = os.path.join(self.analysis_path, "cuckoo.log")
         self.file_path = os.path.realpath(os.path.join(self.analysis_path,
                                                        "binary"))
         self.dropped_path = os.path.join(self.analysis_path, "files")
+        self.dropped_meta_path = os.path.join(self.analysis_path, "files.json")
         self.package_files = os.path.join(self.analysis_path, "package_files")
         self.buffer_path = os.path.join(self.analysis_path, "buffer")
         self.logs_path = os.path.join(self.analysis_path, "logs")
@@ -805,7 +816,7 @@ class Signature(object):
             actions = [
                 "file_opened", "file_written",
                 "file_read", "file_deleted",
-                "file_exists",
+                "file_exists", "file_failed",
             ]
 
         return self.get_summary_generic(pid, actions)
@@ -850,7 +861,7 @@ class Signature(object):
             actions = [
                 "file_opened", "file_written",
                 "file_read", "file_deleted",
-                "file_exists",
+                "file_exists", "file_failed",
             ]
 
         return self._check_value(pattern=pattern,
@@ -1029,11 +1040,21 @@ class Signature(object):
                                  subject=list(urls),
                                  regex=regex,
                                  all=all)
+    
+    def check_suricata_alerts(self, pattern):
+        """Check for pattern in Suricata alert signature
+        @param pattern: string or expression to check for.
+        @return: True/False
+        """
+        for alert in self._caller.results.get("suricata", {}).get("alerts", []):
+            if re.findall(pattern, alert.get("signature", ""), re.I):
+                return True
+        return False
 
     def init(self):
         """Allow signatures to initialize themselves."""
 
-    def mark_call(self, **kwargs):
+    def mark_call(self, *args, **kwargs):
         """Mark the current call as explanation as to why this signature
         matched."""
         mark = {
@@ -1042,19 +1063,29 @@ class Signature(object):
             "cid": self.cid,
             "call": self.call,
         }
-        mark.update(kwargs)
+
+        if args or kwargs:
+            log.warning(
+                "You have provided extra arguments to the mark_call() method "
+                "which no longer supports doing so. Please report explicit "
+                "IOCs through mark_ioc()."
+            )
+
         self.marks.append(mark)
 
-    def mark_ioc(self, category, ioc, **kwargs):
+    def mark_ioc(self, category, ioc, description=None):
         """Mark an IOC as explanation as to why the current signature
         matched."""
         mark = {
             "type": "ioc",
             "category": category,
             "ioc": ioc,
+            "description": description,
         }
-        mark.update(kwargs)
-        self.marks.append(mark)
+
+        # Prevent duplicates.
+        if mark not in self.marks:
+            self.marks.append(mark)
 
     def mark_vol(self, plugin, **kwargs):
         """Mark output of a Volatility plugin as explanation as to why the
@@ -1199,3 +1230,15 @@ class BehaviorHandler(object):
         """Return the handler specific structure, gets placed into
         behavior[self.key]."""
         raise NotImplementedError
+
+class ProtocolHandler(object):
+    """Abstract class for protocol handlers coming out of the analysis."""
+    def __init__(self, handler, version=None):
+        self.handler = handler
+        self.version = version
+
+    def init(self):
+        pass
+
+    def close(self):
+        pass

@@ -1,12 +1,53 @@
                                   CHANGELOG
 
-Cuckoo Sandbox 2.0-dev (2016-xx-xx)
+Cuckoo Sandbox 2.0-rc2 (2016-xx-xx)
 ===================================
 
-* Added .WSF analysis package
-* Added Elasticsearch support
+* Import and Export analysis for improved debugging of user issues
+* Added Elasticsearch support and rely on it for global search
+* Fixed pythonw.exe execution for the new Agent
+* Added initial MISP integration
+* Added initial IRMA integration
+* Added reboot analysis
+* Added Process Monitor (procmon) support to aid debugging
+* Added .docm documents to the Word document analysis package
+* Added .wsf analysis package
+* Added dynamic VBA analysis for Office 2007 products
+* Added dynamic Javascript analysis for Adobe PDF Reader 9
+* Added PE files reconstruction from memory dumps
 * Added dump_delete option to delete process memory dumps after analysis
 * Added sniffer.debug option to create a debug network capture
+* Added PID tracking for dropped files
+* Added per-task Cuckoo logging
+* Added trigger support to the Cuckoo Monitor to reduce behavioral calls noise
+* Added static analysis for Office and PDF samples
+* Added screenshots auxiliary module for Mac OS X analysis
+* Added IP address pinning for the new Cuckoo Agent
+* Introduce the Gatherer (collect VM-specific information)
+* Greatly improved the stability of the Cuckoo Monitor
+* Fixed setting the clock in the Guest for non-English users
+* Fixed support for Ubuntu 16.04
+* Fixed Moloch-related web interface bugs
+* Fixed title issue with the generic package
+* Included Git hashes for debugging purposes in Cuckoo reports
+* Improved tcpdump output and error filtering
+* Enable special monitoring modes by default for malicious documents
+* Use custom pefile2 package to avoid pefile issues
+* Automatically start PowerPoint documents in slide show mode
+* Use the Linux routing table for properly routing analysis traffic
+* Document known 2.0-rc1 issues and fixes in our FAQ
+* Prettify HTML and Javascript content
+* Make Cuckoo Agent interaction less error prone on the Host
+* Updated monitor to include various improvements and fixes
+* Upgraded to the latest httpreplay version
+* Improve dead host identification
+* Custom DNS serve utility
+* Added clicking through of French buttons
+* Resolve names for CLSID identifiers
+* Added meta information to our reports
+* Experimental alpha version of VPN check cronjob script
+* Many Web Interface UI & backend tweaks
+* Many, many bug fixes and code tweaks
 
 Cuckoo Sandbox 2.0-rc1 (2016-01-21)
 ===================================
@@ -16,7 +57,7 @@ Cuckoo Sandbox 2.0-rc1 (2016-01-21)
 * Added mitmproxy support to intercept SSL/TLS traffic
 * Added new Flask based distributed utility
 * Added Javascript analyzer package
-* Added Mozilla FireFox analyzer packege
+* Added Mozilla FireFox analyzer package
 * Added auxiliary module to install a custom certificate in analysis' machine
 * Added auxiliary module to dump TLS master secrets as used by Windows libraries
 * Added analyzer for Linux

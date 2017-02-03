@@ -39,10 +39,12 @@ def choose_package(file_type, file_name, exports):
         return "exe"
     elif "PDF" in file_type or file_name.endswith(".pdf"):
         return "pdf"
+    elif file_name.endswith(".pub"):
+        return "pub"
     elif "Rich Text Format" in file_type or \
             "Microsoft Word" in file_type or \
             "Microsoft Office Word" in file_type or \
-            file_name.endswith((".doc", ".docx", ".rtf")):
+            file_name.endswith((".doc", ".docx", ".rtf", ".docm")):
         return "doc"
     elif "Microsoft Office Excel" in file_type or \
             "Microsoft Excel" in file_type or \
@@ -51,8 +53,6 @@ def choose_package(file_type, file_name, exports):
     elif "Microsoft PowerPoint" in file_type or \
             file_name.endswith((".ppt", ".pptx", ".pps", ".ppsx", ".pptm", ".potm", ".potx", ".ppsm")):
         return "ppt"
-    elif "HTML" in file_type or file_name.endswith((".htm", ".html")):
-        return "ie"
     elif file_name.endswith(".jar"):
         return "jar"
     elif "Zip" in file_type:
@@ -61,7 +61,7 @@ def choose_package(file_type, file_name, exports):
         return "python"
     elif file_name.endswith(".vbs"):
         return "vbs"
-    elif file_name.endswith(".js"):
+    elif file_name.endswith((".js", ".jse")):
         return "js"
     elif file_name.endswith(".msi"):
         return "msi"
@@ -69,5 +69,7 @@ def choose_package(file_type, file_name, exports):
         return "ps1"
     elif file_name.endswith(".wsf"):
         return "wsf"
+    elif "HTML" in file_type or file_name.endswith((".htm", ".html", ".hta")):
+        return "ie"
     else:
         return "generic"

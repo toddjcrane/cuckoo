@@ -40,6 +40,12 @@
                 {% for mark in signature.marks|sigsort %}
                     {% if mark.type == "call" %}
                     {% if mark.first %}
+                        {# Close up the non-API call table #}
+                        {% if not forloop.first %}
+                        </table>
+                        <table class="table table-bordered" style="table-layout: fixed;">
+                        {% endif %}
+
                         <thead>
                             <tr>
                                 <th width="15%">Time &amp; API</th>
@@ -55,8 +61,11 @@
                     </tr>
                     {% elif mark.type == "ioc" %}
                     <tr>
-                        <td colspan="1">{{mark.category}}</td>
-                        <td colspan="4">{{mark.ioc}}</td>
+                        <td>{{ mark.category }}</td>
+                        <td>{{ mark.ioc }}</td>
+                        {% if mark.description %}
+                        <td>{{ mark.description }}</td>
+                        {% endif %}
                     </tr>
                     {% elif mark.type == "generic" %}
                     <tr>

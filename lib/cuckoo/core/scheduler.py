@@ -19,6 +19,7 @@ from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.utils import create_folder
 from lib.cuckoo.core.database import Database, TASK_COMPLETED, TASK_REPORTED
 from lib.cuckoo.core.guest import GuestManager
+from lib.cuckoo.core.log import task_log_start, task_log_stop
 from lib.cuckoo.core.plugins import list_plugins, RunAuxiliary, RunProcessing
 from lib.cuckoo.core.plugins import RunSignatures, RunReporting
 from lib.cuckoo.core.resultserver import ResultServer
@@ -49,10 +50,12 @@ class AnalysisManager(threading.Thread):
         self.cfg = Config()
         self.storage = ""
         self.binary = ""
+        self.storage_binary = ""
         self.machine = None
 
         self.db = Database()
         self.task = self.db.view_task(task_id)
+        self.guest_manager = None
 
         self.interface = None
         self.rt_table = None
@@ -80,6 +83,18 @@ class AnalysisManager(threading.Thread):
             return False
 
         return True
+
+    def check_permissions(self):
+        """Checks if we have permissions to access the file to be analyzed."""
+        if os.access(self.task.target, os.R_OK):
+            return True
+
+        log.error(
+            "Unable to access target file, please check if we have "
+            "permissions to access the file: \"%s\"",
+            self.task.target
+        )
+        return False
 
     def check_file(self):
         """Checks the integrity of the file to be analyzed."""
@@ -115,12 +130,12 @@ class AnalysisManager(threading.Thread):
                 return False
 
         try:
-            new_binary_path = os.path.join(self.storage, "binary")
+            self.storage_binary = os.path.join(self.storage, "binary")
 
             if hasattr(os, "symlink"):
-                os.symlink(self.binary, new_binary_path)
+                os.symlink(self.binary, self.storage_binary)
             else:
-                shutil.copy(self.binary, new_binary_path)
+                shutil.copy(self.binary, self.storage_binary)
         except (AttributeError, OSError) as e:
             log.error("Unable to create symlink/copy from \"%s\" to "
                       "\"%s\": %s", self.binary, self.storage, e)
@@ -280,21 +295,17 @@ class AnalysisManager(threading.Thread):
         if self.task.category == "baseline":
             time.sleep(options["timeout"])
         else:
-            # Initialize the guest manager.
-            guest = GuestManager(self.machine.name, self.machine.ip,
-                                 self.machine.platform, self.task.id)
-
             # Start the analysis.
             self.db.guest_set_status(self.task.id, "starting")
             monitor = self.task.options.get("monitor", "latest")
-            guest.start_analysis(options, monitor)
+            self.guest_manager.start_analysis(options, monitor)
 
             # In case the Agent didn't respond and we force-quit the analysis
             # at some point while it was still starting the analysis the state
             # will be "stop" (or anything but "running", really).
             if self.db.guest_get_status(self.task.id) == "starting":
                 self.db.guest_set_status(self.task.id, "running")
-                guest.wait_for_completion()
+                self.guest_manager.wait_for_completion()
 
             self.db.guest_set_status(self.task.id, "stopping")
 
@@ -314,9 +325,17 @@ class AnalysisManager(threading.Thread):
         if not self.init_storage():
             return False
 
+        # Initiates per-task logging.
+        task_log_start(self.task.id)
+
         self.store_task_info()
 
         if self.task.category == "file":
+            # Check if we have permissions to access the file.
+            # And fail this analysis if we don't have access to the file.
+            if not self.check_permissions():
+                return False
+
             # Check whether the file has been changed for some unknown reason.
             # And fail this analysis if it has been modified.
             if not self.check_file():
@@ -341,8 +360,14 @@ class AnalysisManager(threading.Thread):
             machinery.release(self.machine.label)
             self.errors.put(e)
 
-        aux = RunAuxiliary(task=self.task, machine=self.machine)
-        aux.start()
+        # Initialize the guest manager.
+        self.guest_manager = GuestManager(
+            self.machine.name, self.machine.ip,
+            self.machine.platform, self.task.id, self
+        )
+
+        self.aux = RunAuxiliary(self.task, self.machine, self.guest_manager)
+        self.aux.start()
 
         # Generate the analysis configuration file.
         options = self.build_options()
@@ -379,7 +404,10 @@ class AnalysisManager(threading.Thread):
         except CuckooMachineError as e:
             if not unlocked:
                 machine_lock.release()
-            log.error(str(e), extra={"task_id": self.task.id})
+            log.error(
+                "Machinery error: %s",
+                e, extra={"task_id": self.task.id}
+            )
             log.critical(
                 "A critical error has occurred trying to use the machine "
                 "with name %s during an analysis due to which it is no "
@@ -393,10 +421,13 @@ class AnalysisManager(threading.Thread):
         except CuckooGuestError as e:
             if not unlocked:
                 machine_lock.release()
-            log.error(str(e), extra={"task_id": self.task.id})
+            log.error(
+                "Error from the Cuckoo Guest: %s",
+                e, extra={"task_id": self.task.id}
+            )
         finally:
             # Stop Auxiliary modules.
-            aux.stop()
+            self.aux.stop()
 
             # Take a memory dump of the machine before shutting it off.
             if self.cfg.cuckoo.memory_dump or self.task.memory:
@@ -407,7 +438,7 @@ class AnalysisManager(threading.Thread):
                     log.error("The memory dump functionality is not available "
                               "for the current machine manager.")
                 except CuckooMachineError as e:
-                    log.error(e)
+                    log.error("Machinery error: %s", e)
 
             try:
                 # Stop the analysis machine.
@@ -468,6 +499,12 @@ class AnalysisManager(threading.Thread):
                     os.remove(self.binary)
                 except OSError as e:
                     log.error("Unable to delete the copy of the original file at path \"%s\": %s", self.binary, e)
+            # Check if the binary in the analysis directory is an invalid symlink. If it is, delete it.
+            if os.path.islink(self.storage_binary) and not os.path.exists(self.storage_binary):
+                try:
+                    os.remove(self.storage_binary)
+                except OSError as e:
+                    log.error("Unable to delete symlink to the binary copy at path \"%s\": %s", self.storage_binary, e)
 
         log.info("Task #%d: reports generation completed (path=%s)",
                  self.task.id, self.storage)
@@ -517,10 +554,14 @@ class AnalysisManager(threading.Thread):
 
             # overwrite task.json so we have the latest data inside
             self.store_task_info()
-            log.info("Task #%d: analysis procedure completed", self.task.id)
+            log.info(
+                "Task #%d: analysis procedure completed", self.task.id,
+                extra={"action": "task", "status": "done"}
+            )
         except:
             log.exception("Failure in AnalysisManager.run")
 
+        task_log_stop(self.task.id)
         active_analysis_count -= 1
 
 class Scheduler(object):
@@ -716,7 +757,9 @@ class Scheduler(object):
                 task = self.db.fetch(service=False)
 
             if task:
-                log.debug("Processing task #%s", task.id)
+                log.debug("Processing task #%s", task.id, extra={
+                    "action": "task", "status": "start", "task_id": task.id,
+                })
                 self.total_analysis_count += 1
 
                 # Initialize and start the analysis manager.

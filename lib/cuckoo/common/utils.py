@@ -17,6 +17,7 @@ import platform
 import threading
 import json
 import multiprocessing
+import warnings
 
 from cStringIO import StringIO
 from datetime import datetime
@@ -315,6 +316,9 @@ def md5_file(filepath):
 def sha1_file(filepath):
     return hash_file(hashlib.sha1, filepath)
 
+def sha256_file(filepath):
+    return hash_file(hashlib.sha256, filepath)
+
 GUIDS = {}
 
 def guid_name(guid):
@@ -403,7 +407,11 @@ def htmlprettify(html):
     if not HAVE_BS4:
         return html
 
-    return bs4.BeautifulSoup(html, "html.parser").prettify()
+    # The following ignores the following bs4 warning:
+    # UserWarning: "." looks like a filename, not markup.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", lineno=182)
+        return bs4.BeautifulSoup(html, "html.parser").prettify()
 
 def json_default(obj):
     """JSON serializer for objects not serializable by default json code"""

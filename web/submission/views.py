@@ -10,7 +10,7 @@ from django.conf import settings
 from django.shortcuts import redirect, render
 from django.core.exceptions import ObjectDoesNotExist
 
-sys.path.append(settings.CUCKOO_PATH)
+sys.path.insert(0, settings.CUCKOO_PATH)
 
 from lib.cuckoo.common.config import Config, parse_options, emit_options
 from lib.cuckoo.common.utils import store_temp_file
@@ -254,7 +254,7 @@ def resubmit(request, task_id):
         return index(request, task_id)
 
     if not task:
-        return render(request, "error", {
+        return render(request, "error.html", {
             "error": "No Task found with this ID",
         })
 
@@ -263,13 +263,13 @@ def resubmit(request, task_id):
             "sample_id": task.sample_id,
             "file_name": os.path.basename(task.target),
             "resubmit": "file",
-            "options": task.options,
+            "options": emit_options(task.options),
         })
     elif task.category == "url":
         return render_index(request, {
             "url": task.target,
             "resubmit": "URL",
-            "options": task.options,
+            "options": emit_options(task.options),
         })
 
 def submit_dropped(request, task_id, sha1):
@@ -278,7 +278,7 @@ def submit_dropped(request, task_id, sha1):
 
     task = Database().view_task(task_id)
     if not task:
-        return render(request, "error", {
+        return render(request, "error.html", {
             "error": "No Task found with this ID",
         })
 
@@ -287,5 +287,5 @@ def submit_dropped(request, task_id, sha1):
         "file_name": os.path.basename(filepath),
         "resubmit": "file",
         "dropped_file": True,
-        "options": task.options,
+        "options": emit_options(task.options),
     })
